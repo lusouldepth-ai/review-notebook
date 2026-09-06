@@ -7,6 +7,7 @@ export const ACCOUNT_SCOPED_COLLECTIONS = [
   'reviewSessions',
   'reviewAttempts',
   'feynmanNotes',
+  'learningReviews',
   'weakPointViews',
   'auditLogs'
 ];
@@ -37,6 +38,7 @@ export function extractAccountState(rawState, userId) {
     reviewSessions: state.reviewSessions.filter((item) => item?.userId === user.id),
     reviewAttempts: state.reviewAttempts.filter((item) => item?.userId === user.id),
     feynmanNotes: state.feynmanNotes.filter((item) => item?.userId === user.id),
+    learningReviews: state.learningReviews.filter((item) => item?.userId === user.id),
     weakPointViews: state.weakPointViews.filter((item) => item?.userId === user.id),
     auditLogs: state.auditLogs.filter((item) => item?.userId === user.id),
     reminder: state.reminder,
@@ -61,19 +63,24 @@ export function validateAccountState(rawState, { method, identifier } = {}) {
     return { ok: false, error: '账户身份与本地记录不一致。' };
   }
 
+  const candidateState = {
+    ...rawState,
+    learningReviews:
+      rawState.learningReviews === undefined ? [] : rawState.learningReviews
+  };
   for (const key of ACCOUNT_SCOPED_COLLECTIONS) {
-    if (!Array.isArray(rawState[key])) {
+    if (!Array.isArray(candidateState[key])) {
       return { ok: false, error: `账户数据缺少 ${key} 记录。` };
     }
-    if (rawState[key].some((item) => !isObject(item) || item.userId !== user.id)) {
+    if (candidateState[key].some((item) => !isObject(item) || item.userId !== user.id)) {
       return { ok: false, error: `${key} 中包含其他账户的数据。` };
     }
   }
 
-  const childIds = new Set(rawState.children.map((item) => item.id));
+  const childIds = new Set(candidateState.children.map((item) => item.id));
   for (const key of ACCOUNT_SCOPED_COLLECTIONS.filter((item) => item !== 'children')) {
     if (
-      rawState[key].some(
+      candidateState[key].some(
         (item) => item.childId && typeof item.childId === 'string' && !childIds.has(item.childId)
       )
     ) {
@@ -81,7 +88,7 @@ export function validateAccountState(rawState, { method, identifier } = {}) {
     }
   }
 
-  const state = normalizeState(rawState);
+  const state = normalizeState(candidateState);
   state.currentUserId = user.id;
   state.currentChildId = childIds.has(state.currentChildId)
     ? state.currentChildId

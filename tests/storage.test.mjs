@@ -39,6 +39,7 @@ test('createEmptyState returns required top-level fields', () => {
     'currentUserId',
     'exports',
     'feynmanNotes',
+    'learningReviews',
     'mistakes',
     'reminder',
     'reviewAttempts',
@@ -54,6 +55,7 @@ test('normalizeState falls back to empty fields when shape is invalid', () => {
   assert.deepEqual(normalized.reviewSessions, []);
   assert.deepEqual(normalized.reviewAttempts, []);
   assert.deepEqual(normalized.feynmanNotes, []);
+  assert.deepEqual(normalized.learningReviews, []);
   assert.deepEqual(normalized.weakPointViews, []);
   assert.equal(normalized.currentUserId, null);
 });

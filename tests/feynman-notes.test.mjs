@@ -24,13 +24,20 @@ test('normalizeFeynmanNoteInput requires a concept and keeps learning fields', (
     stuckPoint: '总忘记最后写单位',
     unfamiliarPoint: '应用题单位转换',
     example: '36支',
-    relatedMistakeId: 'm1'
+    relatedMistakeId: 'm1',
+    reviewTaskId: 'm1',
+    reviewStatus: '需再次复习',
+    textbookEvidence: [
+      { textbookId: 't1', filename: '数学三年级.pdf', page: 12, excerpt: '把一个整体平均分。' }
+    ]
   });
 
   assert.equal(valid.ok, true);
   assert.equal(valid.note.concept, '单位');
   assert.equal(valid.note.mastery, '不熟');
   assert.equal(valid.note.childId, 'c1');
+  assert.equal(valid.note.reviewStatus, '需再次复习');
+  assert.equal(valid.note.textbookEvidence[0].page, 12);
 });
 
 test('createFeynmanNote stores user note and links related mistake', () => {

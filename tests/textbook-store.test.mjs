@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  buildTextbookEvidence,
   createTextbookStore,
   inferTextbookMetadataFromFilename,
   MIN_TEXTBOOK_RELEVANCE_SCORE,
@@ -69,6 +70,28 @@ test('rankRelevantPassages distinguishes reliable matches from missing topics', 
 
   assert.ok(matched[0].score >= MIN_TEXTBOOK_RELEVANCE_SCORE);
   assert.equal(missing[0].score, 0);
+});
+
+test('buildTextbookEvidence returns a short original excerpt with source page', () => {
+  const evidence = buildTextbookEvidence(
+    [
+      {
+        textbookId: 'book-1',
+        filename: '四年级语文上册.pdf',
+        page: 7,
+        score: 30,
+        text: '午后一点左右，从远处传来隆隆的响声，好像闷雷滚动。顿时人声鼎沸，有人告诉我们，潮来了！'
+      }
+    ],
+    '潮来了 闷雷滚动',
+    3
+  );
+
+  assert.equal(evidence.length, 1);
+  assert.equal(evidence[0].page, 7);
+  assert.equal(evidence[0].filename, '四年级语文上册.pdf');
+  assert.match(evidence[0].excerpt, /闷雷滚动/);
+  assert.ok(evidence[0].excerpt.length <= 322);
 });
 
 test('system textbooks are available by grade without exposing source paths', async () => {

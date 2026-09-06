@@ -23,6 +23,7 @@ function buildState() {
       { id: 'm2', userId: 'u2', childId: 'c2' }
     ],
     feynmanNotes: [{ id: 'f1', userId: 'u1', childId: 'c1' }],
+    learningReviews: [{ id: 'r1', userId: 'u1', childId: 'c1', topic: '分数' }],
     reminder: { enabled: true },
     currentUserId: 'u1',
     currentChildId: 'c1'
@@ -35,6 +36,7 @@ test('extractAccountState only includes the selected account records', () => {
   assert.deepEqual(account.children.map((item) => item.id), ['c1']);
   assert.deepEqual(account.mistakes.map((item) => item.id), ['m1']);
   assert.deepEqual(account.feynmanNotes.map((item) => item.id), ['f1']);
+  assert.deepEqual(account.learningReviews.map((item) => item.id), ['r1']);
   assert.equal(account.currentChildId, 'c1');
 });
 
@@ -67,4 +69,17 @@ test('validateAccountState rejects records belonging to another account', () => 
     identifier: 'one@example.com'
   });
   assert.equal(result.ok, false);
+});
+
+test('validateAccountState upgrades legacy account data without learning reviews', () => {
+  const account = extractAccountState(buildState(), 'u1');
+  delete account.learningReviews;
+
+  const result = validateAccountState(account, {
+    method: 'email',
+    identifier: 'one@example.com'
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.state.learningReviews, []);
 });

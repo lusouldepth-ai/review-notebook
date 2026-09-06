@@ -46,6 +46,23 @@ function buildQueryTerms(query) {
   return [...new Set(terms)].slice(0, 160);
 }
 
+function compactExcerpt(value) {
+  return String(value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function excerptAroundMatch(text, query, maxLength = 320) {
+  const compactText = compactExcerpt(text);
+  if (!compactText) return '';
+  const terms = buildQueryTerms(query)
+    .filter((term) => compactText.toLowerCase().includes(term))
+    .sort((a, b) => b.length - a.length);
+  const anchor = terms[0] || '';
+  const matchIndex = anchor ? compactText.toLowerCase().indexOf(anchor) : 0;
+  const start = Math.max(0, matchIndex - 90);
+  const end = Math.min(compactText.length, start + maxLength);
+  return `${start > 0 ? '…' : ''}${compactText.slice(start, end)}${end < compactText.length ? '…' : ''}`;
+}
+
 function publicTextbookRecord(record) {
   const { textPath, filePath, ...publicRecord } = record;
   void textPath;
@@ -141,6 +158,28 @@ export function selectRelevantPassages(text, query, limit = 6) {
   return rankRelevantPassages(text, query, limit)
     .sort((a, b) => a.page - b.page)
     .map(({ page, text: passageText }) => ({ page, text: passageText }));
+}
+
+export function buildTextbookEvidence(passages, query, limit = 3) {
+  const seen = new Set();
+  const evidence = [];
+  for (const passage of Array.isArray(passages) ? passages : []) {
+    const excerpt = excerptAroundMatch(passage?.text, query);
+    const filename = safeFileName(passage?.filename || '教材');
+    const page = Number(passage?.page) || 1;
+    const key = `${passage?.textbookId || filename}:${page}:${excerpt}`;
+    if (!excerpt || seen.has(key)) continue;
+    seen.add(key);
+    evidence.push({
+      textbookId: String(passage?.textbookId || ''),
+      filename,
+      page,
+      excerpt,
+      score: Number(passage?.score) || 0
+    });
+    if (evidence.length >= limit) break;
+  }
+  return evidence;
 }
 
 export function createTextbookStore({ rootDir }) {

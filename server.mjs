@@ -18,6 +18,7 @@ import { evaluateWithDeepSeek } from './server/feynman-evaluator.mjs';
 import { getApiErrorStatus, resolveStaticPath } from './server/http-utils.mjs';
 import { createAccountStateStore } from './server/account-state-store.mjs';
 import {
+  buildTextbookEvidence,
   createTextbookStore,
   MIN_TEXTBOOK_RELEVANCE_SCORE,
   rankRelevantPassages
@@ -282,6 +283,10 @@ async function handleFeynmanEvaluation(req, res) {
       .filter((passage) => passage.score >= MIN_TEXTBOOK_RELEVANCE_SCORE)
       .slice(0, 6);
     const sourceMode = passages.length > 0 ? 'textbook' : 'general';
+    const evidence =
+      sourceMode === 'textbook'
+        ? buildTextbookEvidence(passages, `${topic}\n${explanation}`, 3)
+        : [];
     const matchedIds = new Set(passages.map((passage) => passage.textbookId));
     const matchedTextbooks = candidates
       .filter((textbook) => matchedIds.has(textbook.id))
@@ -313,6 +318,7 @@ async function handleFeynmanEvaluation(req, res) {
         mode: sourceMode,
         label: basisLabel,
         matchedPassageCount: passages.length,
+        evidence,
         textbooks: matchedTextbooks
       },
       textbook: matchedTextbooks[0] || null

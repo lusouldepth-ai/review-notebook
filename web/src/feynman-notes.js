@@ -1,3 +1,5 @@
+import { normalizeTextbookEvidence } from './learning-review.js';
+
 const MASTERY_OPTIONS = ['不懂', '不熟', '能讲清'];
 
 function makeId(prefix, now = new Date()) {
@@ -47,7 +49,10 @@ export function normalizeFeynmanNoteInput(input) {
           ? input.aiAssessment
           : null,
       textbookId: String(input?.textbookId ?? '').trim(),
-      textbookName: String(input?.textbookName ?? '').trim()
+      textbookName: String(input?.textbookName ?? '').trim(),
+      textbookEvidence: normalizeTextbookEvidence(input?.textbookEvidence),
+      reviewTaskId: String(input?.reviewTaskId ?? '').trim(),
+      reviewStatus: String(input?.reviewStatus ?? '').trim()
     }
   };
 }

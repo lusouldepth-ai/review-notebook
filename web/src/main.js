@@ -79,6 +79,12 @@ import {
   listTextbooks,
   uploadTextbook
 } from './learning-ai-client.js';
+import {
+  listFeynmanReviewTasks,
+  migrateFeynmanNotesToReviewTasks,
+  resolveFeynmanMastery,
+  upsertFeynmanReviewTask
+} from './learning-review.js';
 import { postAudioForTranscription, startAudioRecording } from './transcribe-client.js';
 
 const statusEl = document.getElementById('app-status');
@@ -86,12 +92,13 @@ const appEl = document.getElementById('app');
 const MISTAKE_LIST_PAGE_SIZE = 20;
 
 function normalizeRuntimeState(rawState) {
-  return {
+  const normalized = {
     ...rawState,
     reminder: normalizeReminder(rawState?.reminder ?? createDefaultReminder()),
     autoExport: normalizeAutoExportConfig(rawState?.autoExport ?? createDefaultAutoExport()),
     auditLogs: normalizeAuditLogs(rawState?.auditLogs)
   };
+  return migrateFeynmanNotesToReviewTasks(normalized);
 }
 
 let state = saveAppState(normalizeRuntimeState(loadAppState()));
@@ -121,6 +128,7 @@ const aiLearningState = {
   evaluation: null,
   basis: null,
   model: '',
+  reviewTask: null,
   textbookStatus: 'idle',
   textbookError: '',
   textbooks: [],
@@ -266,12 +274,19 @@ async function finishAccountLogin(result, successMessage) {
   try {
     const payload = buildAccountPayload(state);
     const databaseResult = await loginLocalAccount(payload);
+    const remoteReviewCount = Array.isArray(databaseResult.accountState?.learningReviews)
+      ? databaseResult.accountState.learningReviews.length
+      : 0;
     state = saveAppState(
       normalizeRuntimeState(mergeAccountState(state, databaseResult.accountState))
     );
     databaseState.status = 'synced';
     databaseState.revision = databaseResult.revision ?? null;
     databaseState.updatedAt = databaseResult.updatedAt ?? null;
+    const localReviewCount = extractAccountState(state, state.currentUserId)?.learningReviews.length ?? 0;
+    if (localReviewCount > remoteReviewCount) {
+      await queueAccountSave(state);
+    }
     successMessage = databaseResult.created
       ? `${successMessage} 已建立对应的本地数据库。`
       : `${successMessage} 已恢复该账号的孩子和学习记录。`;
@@ -365,9 +380,17 @@ async function synchronizeCurrentAccountOnStartup() {
   try {
     const result = await loginLocalAccount(payload);
     state = saveAppState(normalizeRuntimeState(mergeAccountState(state, result.accountState)));
+    const remoteReviewCount = Array.isArray(result.accountState?.learningReviews)
+      ? result.accountState.learningReviews.length
+      : 0;
+    const localReviewCount = extractAccountState(state, state.currentUserId)?.learningReviews.length ?? 0;
     databaseState.status = 'synced';
     databaseState.revision = result.revision ?? null;
     databaseState.updatedAt = result.updatedAt ?? null;
+    if (localReviewCount > remoteReviewCount) {
+      await queueAccountSave(state);
+    }
+    databaseState.status = 'synced';
     maybeTriggerReminder();
     maybeTriggerAutoExport();
     render(result.created ? '现有记录已迁移到本地数据库。' : '已从本地数据库恢复记录。');
@@ -386,6 +409,7 @@ function resetAiLearningState() {
   aiLearningState.evaluation = null;
   aiLearningState.basis = null;
   aiLearningState.model = '';
+  aiLearningState.reviewTask = null;
   aiLearningState.textbookStatus = 'idle';
   aiLearningState.textbookError = '';
   aiLearningState.textbooks = [];
@@ -833,7 +857,25 @@ function renderChildProfileForm() {
   </form>`;
 }
 
-function renderAiEvaluationResult(evaluation, basis) {
+function renderTextbookEvidence(evidence, title = '教材原文证据') {
+  const items = Array.isArray(evidence) ? evidence : [];
+  if (items.length === 0) return '';
+  return `<section class="textbook-evidence">
+    <h3>${escapeHtml(title)}</h3>
+    <ol>
+      ${items
+        .map(
+          (item) => `<li>
+            <strong>${escapeHtml(item.filename || '教材')} · 第 ${escapeHtml(item.page || 1)} 页</strong>
+            <blockquote>${escapeHtml(item.excerpt || '')}</blockquote>
+          </li>`
+        )
+        .join('')}
+    </ol>
+  </section>`;
+}
+
+function renderAiEvaluationResult(evaluation, basis, reviewTask) {
   if (!evaluation) return '';
   const list = (items, emptyText) =>
     items.length > 0
@@ -853,6 +895,22 @@ function renderAiEvaluationResult(evaluation, basis) {
       <span>表达清楚 <strong>${escapeHtml(evaluation.dimensions.clarity)}</strong></span>
       <span>能教会人 <strong>${escapeHtml(evaluation.dimensions.teaching)}</strong></span>
     </div>
+    ${
+      basis?.mode === 'textbook'
+        ? renderTextbookEvidence(basis.evidence)
+        : '<section class="textbook-evidence"><h3>评分依据</h3><p class="hint">本次没有可靠命中教材，因此没有展示教材原文，评分使用通用知识。</p></section>'
+    }
+    ${
+      reviewTask
+        ? `<section class="learning-route ${reviewTask.status === '已掌握' ? 'is-mastered' : 'needs-review'}">
+            <div>
+              <p class="eyebrow">本次学习状态</p>
+              <h3>${reviewTask.status === '已掌握' ? '已掌握，不进入待复习' : '已加入待复习'}</h3>
+            </div>
+            <strong>${escapeHtml(reviewTask.mastery)} · ${escapeHtml(reviewTask.aiScore)} 分</strong>
+          </section>`
+        : ''
+    }
     <div class="ai-feedback-grid">
       <section>
         <h3>已经讲明白</h3>
@@ -1208,6 +1266,34 @@ function handleSwitchWorkspace(event) {
   if (workspace === 'notebook' && aiLearningState.contextKey !== getAiLearningContextKey()) {
     void refreshTextbooksForCurrentChild();
   }
+}
+
+function handleResumeLearningReview(event) {
+  const user = getCurrentUser();
+  const child = getCurrentChild();
+  const taskId = String(event.currentTarget?.dataset?.taskId ?? '').trim();
+  const task = (state.learningReviews || []).find(
+    (item) =>
+      item.id === taskId &&
+      item.userId === user?.id &&
+      item.childId === child?.id &&
+      item.status === '需再次复习'
+  );
+  if (!task) {
+    render('没有找到这条知识复习任务。');
+    return;
+  }
+
+  resetAiLearningState();
+  aiLearningState.draft = {
+    subject: task.subject,
+    topic: task.topic,
+    explanation: ''
+  };
+  uiState.activeWorkspace = 'notebook';
+  render('请让孩子重新讲一遍，AI 会更新这条知识点的掌握状态。');
+  document.getElementById('feynman-explanation')?.focus();
+  void refreshTextbooksForCurrentChild();
 }
 
 function handleCancelEditMistake() {
@@ -1580,6 +1666,7 @@ async function handleEvaluateFeynmanExplanation(event) {
   aiLearningState.error = '';
   aiLearningState.evaluation = null;
   aiLearningState.basis = null;
+  aiLearningState.reviewTask = null;
   render('AI 正在对照教材听讲和评分...');
   try {
     const result = await evaluateFeynmanExplanation({
@@ -1596,11 +1683,32 @@ async function handleEvaluateFeynmanExplanation(event) {
     aiLearningState.basis = result.basis || null;
     aiLearningState.model = result.model || '';
     const score = Number(result.evaluation.totalScore || 0);
-    const mastery = score >= 85 ? '能讲清' : score >= 60 ? '不熟' : '不懂';
+    const mastery = resolveFeynmanMastery(score);
     const basisName =
       result.basis?.label || result.textbook?.filename || '通用知识评估';
-    const noteResult = createFeynmanNote(
+    const reviewTaskResult = upsertFeynmanReviewTask(
       state,
+      user.id,
+      {
+        childId: child.id,
+        subject: draft.subject,
+        topic: draft.topic,
+        explanation: draft.explanation,
+        score,
+        unclear: result.evaluation.unclear.join('；'),
+        unfamiliar: result.evaluation.unfamiliar.join('；'),
+        teachBetter: result.evaluation.teachBetter,
+        followUpQuestion: result.evaluation.followUpQuestion,
+        evidence: result.basis?.evidence
+      },
+      new Date()
+    );
+    if (!reviewTaskResult.ok) {
+      throw new Error(reviewTaskResult.error || '自动创建复习任务失败。');
+    }
+    aiLearningState.reviewTask = reviewTaskResult.task;
+    const noteResult = createFeynmanNote(
+      reviewTaskResult.state,
       user.id,
       {
         childId: child.id,
@@ -1615,7 +1723,10 @@ async function handleEvaluateFeynmanExplanation(event) {
         aiScore: score,
         aiAssessment: result.evaluation,
         textbookId: result.textbook?.id || '',
-        textbookName: basisName
+        textbookName: basisName,
+        textbookEvidence: result.basis?.evidence,
+        reviewTaskId: reviewTaskResult.task.id,
+        reviewStatus: reviewTaskResult.status
       },
       new Date()
     );
@@ -1623,7 +1734,11 @@ async function handleEvaluateFeynmanExplanation(event) {
       state = saveRuntimeState(noteResult.state);
       writeAuditLog('feynman.ai_evaluation', 'success', `完成教材评估：${draft.topic}`);
     }
-    render('AI 已完成评分，结果已自动保存到学习记录。');
+    render(
+      reviewTaskResult.status === '已掌握'
+        ? 'AI 已完成评分：本课已掌握，并已保存到当前孩子的数据库。'
+        : 'AI 已完成评分：本课已自动加入当前孩子的待复习队列。'
+    );
   } catch (error) {
     aiLearningState.status = 'error';
     aiLearningState.error = error?.message || 'AI 评估失败。';
@@ -2285,6 +2400,10 @@ function renderUserHome(message) {
   const reviewPracticeMistakes = currentChildId
     ? getReviewPracticeMistakes(user.id, currentChildId)
     : [];
+  const learningReviewTasks = currentChildId
+    ? listFeynmanReviewTasks(state, user.id, currentChildId, '需再次复习')
+    : [];
+  const pendingReviewCount = reviewPracticeMistakes.length + learningReviewTasks.length;
   const rememberedReviewSession = currentChildId
     ? findRememberedReviewSession(user.id, currentChildId)
     : null;
@@ -2451,6 +2570,8 @@ function renderUserHome(message) {
                 <p>${escapeHtml(note.explainSimply || '还没有写自己的解释。')}</p>
                 <p class="hint">没讲明白：${escapeHtml(note.stuckPoint || '—')} / 还不熟：${escapeHtml(note.unfamiliarPoint || '—')}</p>
                 ${note.textbookName ? `<p class="hint">教材依据：${escapeHtml(note.textbookName)}</p>` : ''}
+                ${note.reviewStatus ? `<p class="hint">复习状态：${escapeHtml(note.reviewStatus)}</p>` : ''}
+                ${renderTextbookEvidence(note.textbookEvidence, '本次教材证据')}
                 <details class="advanced-block">
                   <summary>补一条复习记录</summary>
                   <form class="feynman-review-form form-grid top-gap">
@@ -2478,6 +2599,33 @@ function renderUserHome(message) {
         <span>正确答案：${escapeHtml(uiState.lastReviewResult.correctAnswer || '（空）')}</span>
       </div>`
     : '';
+  const learningReviewPanel = `<section class="learning-thread">
+    <div class="thread-head">
+      <div>
+        <p class="eyebrow">FEYNMAN REVIEW</p>
+        <h2>知识讲解待复习</h2>
+      </div>
+      <strong>${learningReviewTasks.length} 个知识点</strong>
+    </div>
+    ${
+      learningReviewTasks.length === 0
+        ? '<p class="hint">当前没有需要重新讲解的知识点。</p>'
+        : `<div class="learning-review-list">
+            ${learningReviewTasks
+              .map(
+                (task) => `<article class="learning-review-item">
+                  <div>
+                    <span>${escapeHtml(task.subject)} · ${escapeHtml(task.mastery)}</span>
+                    <h3>${escapeHtml(task.topic)}</h3>
+                    <p class="hint">上次 ${escapeHtml(task.aiScore)} 分${task.unfamiliar ? ` · ${escapeHtml(task.unfamiliar)}` : ''}</p>
+                  </div>
+                  <button type="button" class="ghost resume-learning-review-button" data-task-id="${escapeHtml(task.id)}">再讲一次</button>
+                </article>`
+              )
+              .join('')}
+          </div>`
+    }
+  </section>`;
   const reviewPracticePanel = `<section class="learning-thread">
       <div class="thread-head">
         <div>
@@ -2785,6 +2933,7 @@ function renderUserHome(message) {
           <span>孩子 ${children.length}</span>
           <span>错题 ${allMistakes.length}</span>
           <span>笔记 ${feynmanNotes.length}</span>
+          <span>知识待复习 ${learningReviewTasks.length}</span>
           <span>薄弱点进入 ${currentWeakPointViews.reduce((sum, item) => sum + Number(item.viewCount || 0), 0)}</span>
         </div>
         <button id="logout-button" class="ghost">退出登录</button>
@@ -2799,7 +2948,7 @@ function renderUserHome(message) {
           <div class="command-metrics">
             <span class="stat-pill">登录：${user.method === 'phone' ? '手机号' : '邮箱'}</span>
             <span class="stat-pill" title="${escapeHtml(databaseState.error || '孩子和学习记录保存在本机 SQLite 数据库')}">本地数据库：${getDatabaseStatusLabel()}</span>
-            <span class="stat-pill">待复习：${reviewPracticeMistakes.length}</span>
+            <span class="stat-pill">待复习：${pendingReviewCount}</span>
             <span class="stat-pill">本轮：${activeReviewProgress?.reviewedCount ?? 0}/${activeReviewProgress?.totalCount ?? reviewPracticeMistakes.length}</span>
           </div>
           ${message ? `<p class="success">${message}</p>` : ''}
@@ -2954,6 +3103,7 @@ function renderUserHome(message) {
     </section>
 
     <section class="workspace-panel ${isReviewWorkspace ? '' : 'is-hidden'} top-gap">
+      ${learningReviewPanel}
       ${reviewPracticePanel}
       <section class="panel">
         <h2>复习队列</h2>
@@ -3062,7 +3212,11 @@ function renderUserHome(message) {
           <button type="submit" ${aiLearningState.status === 'processing' ? 'disabled' : ''}>${aiLearningState.status === 'processing' ? 'AI 正在听讲和评分...' : '请 AI 听讲并打分'}</button>
         </form>
         ${aiLearningState.error ? `<p class="error">${escapeHtml(aiLearningState.error)}</p>` : ''}
-        ${renderAiEvaluationResult(aiLearningState.evaluation, aiLearningState.basis)}
+        ${renderAiEvaluationResult(
+          aiLearningState.evaluation,
+          aiLearningState.basis,
+          aiLearningState.reviewTask
+        )}
       </section>
       <section class="panel note-list-panel">
         <div class="thread-head">
@@ -3382,6 +3536,9 @@ function renderUserHome(message) {
   stopReviewSessionButton?.addEventListener('click', handleStopReviewSession);
   const reviewAnswerForm = document.getElementById('review-answer-form');
   reviewAnswerForm?.addEventListener('submit', handleReviewAnswerSubmit);
+  document.querySelectorAll('.resume-learning-review-button').forEach((button) => {
+    button.addEventListener('click', handleResumeLearningReview);
+  });
   const startEditMistakeButton = document.getElementById('start-edit-mistake-button');
   startEditMistakeButton?.addEventListener('click', handleStartEditMistake);
   const editMistakeForm = document.getElementById('edit-mistake-form');
