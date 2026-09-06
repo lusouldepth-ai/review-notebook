@@ -1,16 +1,14 @@
-export async function postImageForOcr(fileOrBlob) {
-  const response = await fetch('/api/ocr', {
+import { requestJson } from './api-client.js';
+
+export async function postImageForOcr(fileOrBlob, fetchImpl = fetch) {
+  return requestJson('/api/ocr', {
     method: 'POST',
     headers: {
       'Content-Type': fileOrBlob.type || 'image/png'
     },
     body: fileOrBlob
+  }, {
+    fetchImpl,
+    fallbackMessage: 'OCR 识别失败，请稍后重试。'
   });
-
-  const payload = await response.json();
-  if (!response.ok || payload.ok === false) {
-    throw new Error(payload.error || 'OCR 识别失败');
-  }
-
-  return payload;
 }

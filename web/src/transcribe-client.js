@@ -1,3 +1,5 @@
+import { requestJson } from './api-client.js';
+
 export function ensureMediaRecorderSupport() {
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error('当前浏览器不支持麦克风采集。');
@@ -7,21 +9,17 @@ export function ensureMediaRecorderSupport() {
   }
 }
 
-export async function postAudioForTranscription(blob) {
-  const response = await fetch('/api/transcribe', {
+export async function postAudioForTranscription(blob, fetchImpl = fetch) {
+  return requestJson('/api/transcribe', {
     method: 'POST',
     headers: {
       'Content-Type': blob.type || 'audio/webm'
     },
     body: blob
+  }, {
+    fetchImpl,
+    fallbackMessage: '转写失败，请稍后重试。'
   });
-
-  const payload = await response.json();
-  if (!response.ok || payload.ok === false) {
-    throw new Error(payload.error || '转写失败');
-  }
-
-  return payload;
 }
 
 export async function startAudioRecording() {
