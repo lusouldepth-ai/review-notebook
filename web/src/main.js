@@ -1,4 +1,6 @@
 import { listSavedLoginAccounts, loginWithLocalState, logoutWithLocalState } from './auth.js';
+import { extractAccountState, mergeAccountState } from './account-state.js';
+import { loginLocalAccount, saveLocalAccountState } from './account-state-client.js';
 import {
   createDefaultAutoExport,
   evaluateAutoExport,
@@ -96,6 +98,13 @@ let state = saveAppState(normalizeRuntimeState(loadAppState()));
 let recorderController = null;
 let feynmanRecorderController = null;
 let reminderTimerId = null;
+let accountSaveQueue = Promise.resolve();
+const databaseState = {
+  status: getCurrentUser() ? 'connecting' : 'idle',
+  revision: null,
+  updatedAt: null,
+  error: ''
+};
 const voiceState = {
   status: 'idle',
   text: '',
@@ -174,11 +183,48 @@ function getAutoExportConfig() {
 }
 
 function getRecentAuditLogs(limit = 20) {
-  return normalizeAuditLogs(state.auditLogs).slice().reverse().slice(0, limit);
+  const userId = getCurrentUser()?.id;
+  return normalizeAuditLogs(state.auditLogs)
+    .filter((item) => item.userId === userId)
+    .slice()
+    .reverse()
+    .slice(0, limit);
+}
+
+function buildAccountPayload(sourceState = state) {
+  const user = sourceState.users.find((item) => item.id === sourceState.currentUserId);
+  if (!user) return null;
+  const accountState = extractAccountState(sourceState, user.id);
+  if (!accountState) return null;
+  return { identifier: user.identifier, accountState };
+}
+
+function queueAccountSave(sourceState = state) {
+  const payload = buildAccountPayload(sourceState);
+  if (!payload) return accountSaveQueue;
+
+  databaseState.status = 'saving';
+  databaseState.error = '';
+  accountSaveQueue = accountSaveQueue
+    .catch(() => undefined)
+    .then(async () => {
+      const result = await saveLocalAccountState(payload);
+      databaseState.status = 'synced';
+      databaseState.revision = result.revision ?? databaseState.revision;
+      databaseState.updatedAt = result.updatedAt ?? databaseState.updatedAt;
+      return result;
+    })
+    .catch((error) => {
+      databaseState.status = 'error';
+      databaseState.error = error?.message || '本地数据库保存失败。';
+      throw error;
+    });
+  return accountSaveQueue;
 }
 
 function saveRuntimeState(nextState) {
   state = saveAppState(normalizeRuntimeState(nextState));
+  void queueAccountSave(state).catch(() => undefined);
   return state;
 }
 
@@ -211,7 +257,36 @@ function confirmDangerAction({ actionLabel, summaryLines = [] }) {
   return true;
 }
 
-function handleLogin(event) {
+async function finishAccountLogin(result, successMessage) {
+  state = saveAppState(normalizeRuntimeState(result.state));
+  databaseState.status = 'connecting';
+  databaseState.error = '';
+  render('正在读取本地数据库...');
+
+  try {
+    const payload = buildAccountPayload(state);
+    const databaseResult = await loginLocalAccount(payload);
+    state = saveAppState(
+      normalizeRuntimeState(mergeAccountState(state, databaseResult.accountState))
+    );
+    databaseState.status = 'synced';
+    databaseState.revision = databaseResult.revision ?? null;
+    databaseState.updatedAt = databaseResult.updatedAt ?? null;
+    successMessage = databaseResult.created
+      ? `${successMessage} 已建立对应的本地数据库。`
+      : `${successMessage} 已恢复该账号的孩子和学习记录。`;
+  } catch (error) {
+    databaseState.status = 'error';
+    databaseState.error = error?.message || '本地数据库连接失败。';
+    successMessage = `${successMessage} 数据库暂时不可用，当前记录仍保存在浏览器。`;
+  }
+
+  maybeTriggerReminder();
+  maybeTriggerAutoExport();
+  render(successMessage);
+}
+
+async function handleLogin(event) {
   event.preventDefault();
   const form = new FormData(event.currentTarget);
   const result = loginWithLocalState(state, {
@@ -224,13 +299,13 @@ function handleLogin(event) {
     return;
   }
 
-  state = saveAppState(result.state);
-  maybeTriggerReminder();
-  maybeTriggerAutoExport();
-  render(result.isNewUser ? '登录成功，已创建本地家长账号。' : '登录成功。');
+  await finishAccountLogin(
+    result,
+    result.isNewUser ? '登录成功，已创建本地家长账号。' : '登录成功。'
+  );
 }
 
-function handleSavedAccountLogin(event) {
+async function handleSavedAccountLogin(event) {
   const button = event.currentTarget;
   const identifier = String(button?.dataset?.identifier ?? '').trim();
   const displayName = String(button?.dataset?.displayName ?? '').trim();
@@ -249,13 +324,11 @@ function handleSavedAccountLogin(event) {
     return;
   }
 
-  state = saveAppState(result.state);
-  maybeTriggerReminder();
-  maybeTriggerAutoExport();
-  render('已使用本机保存账号登录。');
+  await finishAccountLogin(result, '已使用本机保存账号登录。');
 }
 
-function handleLogout() {
+async function handleLogout() {
+  await accountSaveQueue.catch(() => undefined);
   recorderController = null;
   feynmanRecorderController = null;
   voiceState.status = 'idle';
@@ -266,7 +339,45 @@ function handleLogout() {
   feynmanVoiceState.error = '';
   resetAiLearningState();
   state = saveAppState(logoutWithLocalState(state));
+  databaseState.status = 'idle';
+  databaseState.error = '';
   render('已退出登录。');
+}
+
+function getDatabaseStatusLabel() {
+  const labels = {
+    idle: '未连接',
+    connecting: '连接中',
+    saving: '保存中',
+    synced: '已保存',
+    error: '保存异常'
+  };
+  return labels[databaseState.status] || labels.idle;
+}
+
+async function synchronizeCurrentAccountOnStartup() {
+  const payload = buildAccountPayload(state);
+  if (!payload) return;
+
+  databaseState.status = 'connecting';
+  databaseState.error = '';
+  render('正在连接本地数据库...');
+  try {
+    const result = await loginLocalAccount(payload);
+    state = saveAppState(normalizeRuntimeState(mergeAccountState(state, result.accountState)));
+    databaseState.status = 'synced';
+    databaseState.revision = result.revision ?? null;
+    databaseState.updatedAt = result.updatedAt ?? null;
+    maybeTriggerReminder();
+    maybeTriggerAutoExport();
+    render(result.created ? '现有记录已迁移到本地数据库。' : '已从本地数据库恢复记录。');
+  } catch (error) {
+    databaseState.status = 'error';
+    databaseState.error = error?.message || '本地数据库连接失败。';
+    maybeTriggerReminder();
+    maybeTriggerAutoExport();
+    render('本地数据库暂时不可用，当前记录仍保存在浏览器。');
+  }
 }
 
 function resetAiLearningState() {
@@ -349,7 +460,7 @@ function maybeTriggerReminder() {
     ...reminder,
     lastNotifiedAt: now.toISOString()
   };
-  state = saveAppState({
+  state = saveRuntimeState({
     ...state,
     reminder: nextReminder
   });
@@ -373,7 +484,7 @@ function handleReminderSave(event) {
     lastNotifiedAt: state.reminder?.lastNotifiedAt ?? null
   });
 
-  state = saveAppState({
+  state = saveRuntimeState({
     ...state,
     reminder: nextReminder
   });
@@ -444,7 +555,7 @@ function handleCreateChild(event) {
     return;
   }
 
-  state = saveAppState(result.state);
+  state = saveRuntimeState(result.state);
   uiState.activeWorkspace = 'notebook';
   resetAiLearningState();
   render(`孩子档案已创建：${result.child.name}。现在可以上传教材并开始讲给 AI 听。`);
@@ -461,7 +572,7 @@ function handleSwitchChild(event) {
     render(result.error);
     return;
   }
-  state = saveAppState(result.state);
+  state = saveRuntimeState(result.state);
   uiState.listVisibleCount = MISTAKE_LIST_PAGE_SIZE;
   uiState.selectedMistakeId = null;
   uiState.editingMistakeId = null;
@@ -570,7 +681,7 @@ function handleCreateMistake(event) {
     return;
   }
 
-  state = saveAppState(result.state);
+  state = saveRuntimeState(result.state);
   uiState.mistakeSubject = String(form.get('subject') ?? '语文');
   uiState.mistakeCategory = resolvedCategory;
   render(
@@ -2061,7 +2172,7 @@ function renderLoginForm(errorMessage) {
       <div class="auth-showcase">
         <p class="eyebrow">LOCAL-FIRST STUDY WORKSPACE</p>
         <h2>错题本</h2>
-        <p class="hint">重启电脑后仍可继续使用，数据默认留在本机浏览器，不走云端。</p>
+        <p class="hint">重启电脑后仍可继续使用，孩子和学习记录保存在本机数据库，不走云端。</p>
         <ul class="auth-points">
           <li>拍照 OCR + 语音转写 + 手动录入</li>
           <li>复习筛选、导出打印、自动提醒</li>
@@ -2070,7 +2181,7 @@ function renderLoginForm(errorMessage) {
       </div>
       <section class="auth-panel">
         <h3>登录本地错题本</h3>
-        <p class="hint">手机号或邮箱均可，仅用于本地识别家长账号。</p>
+        <p class="hint">手机号或邮箱均可，仅用于匹配这台电脑上的对应数据库。</p>
         ${errorMessage ? `<p class="error">${errorMessage}</p>` : ''}
         <form id="login-form" class="form-grid top-gap">
           <label>
@@ -2687,6 +2798,7 @@ function renderUserHome(message) {
           </div>
           <div class="command-metrics">
             <span class="stat-pill">登录：${user.method === 'phone' ? '手机号' : '邮箱'}</span>
+            <span class="stat-pill" title="${escapeHtml(databaseState.error || '孩子和学习记录保存在本机 SQLite 数据库')}">本地数据库：${getDatabaseStatusLabel()}</span>
             <span class="stat-pill">待复习：${reviewPracticeMistakes.length}</span>
             <span class="stat-pill">本轮：${activeReviewProgress?.reviewedCount ?? 0}/${activeReviewProgress?.totalCount ?? reviewPracticeMistakes.length}</span>
           </div>
@@ -3368,6 +3480,5 @@ function startReminderTicker() {
 }
 
 startReminderTicker();
-maybeTriggerReminder();
-maybeTriggerAutoExport();
 render();
+void synchronizeCurrentAccountOnStartup();

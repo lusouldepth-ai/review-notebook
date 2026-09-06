@@ -16,16 +16,22 @@ import {
 } from './server/transcribe-runner.mjs';
 import { evaluateWithDeepSeek } from './server/feynman-evaluator.mjs';
 import { getApiErrorStatus, resolveStaticPath } from './server/http-utils.mjs';
+import { createAccountStateStore } from './server/account-state-store.mjs';
 import {
   createTextbookStore,
   MIN_TEXTBOOK_RELEVANCE_SCORE,
   rankRelevantPassages
 } from './server/textbook-store.mjs';
+import { validateLoginInput } from './web/src/auth.js';
+import { validateAccountState } from './web/src/account-state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.join(__dirname, 'web');
 const port = Number(process.env.PORT || 5173);
 const textbookStore = createTextbookStore({ rootDir: path.join(__dirname, 'data', 'textbooks') });
+const accountStateStore = createAccountStateStore({
+  dbPath: path.join(__dirname, 'data', 'review-notebook.sqlite')
+});
 
 const contentTypeMap = new Map([
   ['.html', 'text/html; charset=utf-8'],
@@ -326,6 +332,86 @@ async function handleFeynmanEvaluation(req, res) {
   }
 }
 
+function validateAccountRequest(input) {
+  const login = validateLoginInput({ identifier: input?.identifier });
+  if (!login.ok) return login;
+
+  const account = validateAccountState(input?.accountState, {
+    method: login.method,
+    identifier: login.identifier
+  });
+  if (!account.ok) return account;
+
+  return {
+    ok: true,
+    method: login.method,
+    identifier: login.identifier,
+    state: account.state
+  };
+}
+
+async function handleAccountLogin(req, res) {
+  try {
+    const input = await readJsonBody(req, 5 * 1024 * 1024);
+    const validated = validateAccountRequest(input);
+    if (!validated.ok) {
+      sendJson(res, 400, { ok: false, error: validated.error });
+      return;
+    }
+
+    let record = accountStateStore.load(validated);
+    const created = !record;
+    if (!record) {
+      record = accountStateStore.create({
+        method: validated.method,
+        identifier: validated.identifier,
+        state: validated.state
+      });
+    }
+    sendJson(res, 200, {
+      ok: true,
+      created,
+      accountState: record.state,
+      revision: record.revision,
+      updatedAt: record.updatedAt
+    });
+  } catch (error) {
+    const status = error?.message === 'payload_too_large' ? 413 : error?.code === 'INVALID_JSON' ? 400 : 500;
+    sendJson(res, status, {
+      ok: false,
+      error: status === 413 ? '本地账户数据过大，无法保存。' : '本地数据库登录失败。'
+    });
+  }
+}
+
+async function handleAccountSave(req, res) {
+  try {
+    const input = await readJsonBody(req, 5 * 1024 * 1024);
+    const validated = validateAccountRequest(input);
+    if (!validated.ok) {
+      sendJson(res, 400, { ok: false, error: validated.error });
+      return;
+    }
+
+    const record = accountStateStore.save({
+      method: validated.method,
+      identifier: validated.identifier,
+      state: validated.state
+    });
+    sendJson(res, 200, {
+      ok: true,
+      revision: record.revision,
+      updatedAt: record.updatedAt
+    });
+  } catch (error) {
+    const status = error?.message === 'payload_too_large' ? 413 : error?.code === 'INVALID_JSON' ? 400 : 500;
+    sendJson(res, status, {
+      ok: false,
+      error: status === 413 ? '本地账户数据过大，无法保存。' : '本地数据库保存失败。'
+    });
+  }
+}
+
 createServer(async (req, res) => {
   if (!req.url) {
     res.writeHead(400);
@@ -334,6 +420,16 @@ createServer(async (req, res) => {
   }
 
   const requestUrl = new URL(req.url, 'http://localhost');
+
+  if (req.method === 'POST' && requestUrl.pathname === '/api/account/login') {
+    await handleAccountLogin(req, res);
+    return;
+  }
+
+  if (req.method === 'POST' && requestUrl.pathname === '/api/account/state') {
+    await handleAccountSave(req, res);
+    return;
+  }
 
   if (req.method === 'POST' && requestUrl.pathname === '/api/transcribe') {
     await handleTranscribe(req, res);
