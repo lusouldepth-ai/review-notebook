@@ -865,6 +865,36 @@ tbody tr:nth-child(even) {
   color: var(--ok);
 }
 
+.review-points,
+.saved-review-points {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.review-points {
+  padding: 0.85rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.review-points .compact-list,
+.saved-review-points .compact-list,
+.learning-review-item .compact-list {
+  margin-bottom: 0;
+}
+
+.evaluation-save-bar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 1rem;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--line-strong);
+}
+
+.evaluation-save-bar p {
+  margin-right: auto;
+}
+
 .learning-review-list {
   display: grid;
   gap: 0.55rem;
@@ -1015,6 +1045,11 @@ tbody tr:nth-child(even) {
   .ai-dimension-grid,
   .ai-feedback-grid {
     grid-template-columns: 1fr;
+  }
+
+  .evaluation-save-bar {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .ai-total-score {

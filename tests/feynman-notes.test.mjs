@@ -27,6 +27,7 @@ test('normalizeFeynmanNoteInput requires a concept and keeps learning fields', (
     relatedMistakeId: 'm1',
     reviewTaskId: 'm1',
     reviewStatus: '需再次复习',
+    reviewPoints: ['分清单位', '检查单位换算'],
     textbookEvidence: [
       { textbookId: 't1', filename: '数学三年级.pdf', page: 12, excerpt: '把一个整体平均分。' }
     ]
@@ -37,6 +38,7 @@ test('normalizeFeynmanNoteInput requires a concept and keeps learning fields', (
   assert.equal(valid.note.mastery, '不熟');
   assert.equal(valid.note.childId, 'c1');
   assert.equal(valid.note.reviewStatus, '需再次复习');
+  assert.deepEqual(valid.note.reviewPoints, ['分清单位', '检查单位换算']);
   assert.equal(valid.note.textbookEvidence[0].page, 12);
 });
 

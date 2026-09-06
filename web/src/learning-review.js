@@ -10,6 +10,33 @@ function normalizeScore(value) {
   return Number.isFinite(score) ? Math.max(0, Math.min(100, Math.round(score))) : 0;
 }
 
+export function normalizeReviewPoints(value) {
+  const values = Array.isArray(value) ? value : [value];
+  const seen = new Set();
+  const points = [];
+  for (const item of values) {
+    for (const part of clean(item).split(/[；;\n]+/)) {
+      const point = clean(part).slice(0, 240);
+      const key = point.toLowerCase();
+      if (!point || seen.has(key)) continue;
+      seen.add(key);
+      points.push(point);
+      if (points.length >= 6) return points;
+    }
+  }
+  return points;
+}
+
+export function buildFeynmanReviewPoints(evaluation, score) {
+  if (resolveFeynmanReviewStatus(score) === '已掌握') return [];
+  const points = normalizeReviewPoints([
+    ...(Array.isArray(evaluation?.unclear) ? evaluation.unclear : []),
+    ...(Array.isArray(evaluation?.unfamiliar) ? evaluation.unfamiliar : [])
+  ]);
+  if (points.length > 0) return points;
+  return normalizeReviewPoints(evaluation?.followUpQuestion || '重新用自己的话讲清这个知识点。');
+}
+
 export function normalizeTextbookEvidence(value) {
   if (!Array.isArray(value)) return [];
   return value
@@ -46,6 +73,8 @@ export function upsertFeynmanReviewTask(state, userId, input, now = new Date()) 
   const mastery = resolveFeynmanMastery(score);
   const status = resolveFeynmanReviewStatus(score);
   const evidence = normalizeTextbookEvidence(input?.evidence);
+  const reviewPoints =
+    status === '已掌握' ? [] : normalizeReviewPoints(input?.reviewPoints);
   const child = (state.children || []).find(
     (item) => item.id === childId && item.userId === userId
   );
@@ -77,6 +106,7 @@ export function upsertFeynmanReviewTask(state, userId, input, now = new Date()) 
     aiScore: score,
     mastery,
     status,
+    reviewPoints,
     textbookEvidence: evidence,
     lastEvaluatedAt: timestamp,
     updatedAt: timestamp
@@ -106,13 +136,25 @@ export function listFeynmanReviewTasks(state, userId, childId, status = '') {
 }
 
 export function migrateFeynmanNotesToReviewTasks(state) {
+  const learningReviews = (Array.isArray(state?.learningReviews) ? state.learningReviews : []).map(
+    (item) => ({
+      ...item,
+      reviewPoints:
+        item.status === '已掌握'
+          ? []
+          : normalizeReviewPoints(
+              item.reviewPoints?.length ? item.reviewPoints : [item.unclear, item.unfamiliar]
+            )
+    })
+  );
+  let nextState = { ...state, learningReviews };
   const existingKeys = new Set(
-    (Array.isArray(state?.learningReviews) ? state.learningReviews : []).map(
+    learningReviews.map(
       (item) => `${item.userId}:${item.childId}:${item.subject}:${item.topic}`
     )
   );
   const latestNotes = new Map();
-  for (const note of Array.isArray(state?.feynmanNotes) ? state.feynmanNotes : []) {
+  for (const note of Array.isArray(nextState?.feynmanNotes) ? nextState.feynmanNotes : []) {
     if (!note?.userId || !note?.childId || !note?.subject || !note?.concept) continue;
     if (!Number.isFinite(Number(note.aiScore))) continue;
     const key = `${note.userId}:${note.childId}:${note.subject}:${note.concept}`;
@@ -122,7 +164,6 @@ export function migrateFeynmanNotesToReviewTasks(state) {
     }
   }
 
-  let nextState = state;
   for (const [key, note] of latestNotes) {
     if (existingKeys.has(key)) continue;
     const timestamp = new Date(note.updatedAt || note.createdAt || Date.now());
@@ -137,6 +178,7 @@ export function migrateFeynmanNotesToReviewTasks(state) {
       unfamiliar: note.unfamiliarPoint,
       teachBetter: note.teachBack,
       followUpQuestion: note.aiAssessment?.followUpQuestion,
+      reviewPoints: note.reviewPoints || [note.stuckPoint, note.unfamiliarPoint],
       evidence: note.textbookEvidence
     }, now);
     if (result.ok) {

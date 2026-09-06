@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildFeynmanReviewPoints,
   migrateFeynmanNotesToReviewTasks,
+  normalizeReviewPoints,
   resolveFeynmanMastery,
   resolveFeynmanReviewStatus,
   upsertFeynmanReviewTask
@@ -25,6 +27,17 @@ test('score thresholds map to mastery and review status', () => {
   assert.equal(resolveFeynmanReviewStatus(85), '已掌握');
 });
 
+test('low score turns unclear and unfamiliar feedback into review points', () => {
+  const points = buildFeynmanReviewPoints({
+    unclear: ['没有说清楚运算顺序', '没有说清楚运算顺序'],
+    unfamiliar: ['小括号和中括号的先后顺序']
+  }, 62);
+
+  assert.deepEqual(points, ['没有说清楚运算顺序', '小括号和中括号的先后顺序']);
+  assert.deepEqual(normalizeReviewPoints('第一点；第二点\n第一点'), ['第一点', '第二点']);
+  assert.deepEqual(buildFeynmanReviewPoints({ unclear: ['不应保留'] }, 90), []);
+});
+
 test('low score creates a child-scoped Feynman task in the review queue', () => {
   const result = upsertFeynmanReviewTask(stateWithChild(), 'u1', {
     childId: 'c1',
@@ -36,6 +49,7 @@ test('low score creates a child-scoped Feynman task in the review queue', () => 
     unfamiliar: '课文顺序',
     teachBetter: '先讲潮来前，再讲潮来时和潮去后。',
     followUpQuestion: '课文按什么顺序写？',
+    reviewPoints: ['讲清潮来前、潮来时和潮去后的顺序'],
     evidence: [{ filename: '语文四年级上册.pdf', page: 2, excerpt: '钱塘江大潮，自古以来被称为天下奇观。' }]
   }, NOW);
 
@@ -43,6 +57,7 @@ test('low score creates a child-scoped Feynman task in the review queue', () => 
   assert.equal(result.status, '需再次复习');
   assert.equal(result.task.childId, 'c1');
   assert.equal(result.task.textbookEvidence[0].page, 2);
+  assert.deepEqual(result.task.reviewPoints, ['讲清潮来前、潮来时和潮去后的顺序']);
   assert.equal(result.state.learningReviews.length, 1);
   assert.equal(result.state.mistakes.length, 0);
 });
@@ -57,6 +72,7 @@ test('a later high score updates the same lesson task to mastered', () => {
     topic: '大数的读写',
     explanation: '从高位起一级一级读。',
     score: 91,
+    reviewPoints: ['高分时不应继续保留'],
     teachBetter: '先分级，再从最高级读起。'
   }, new Date('2026-09-07T05:00:00.000Z'));
 
@@ -65,6 +81,7 @@ test('a later high score updates the same lesson task to mastered', () => {
   assert.equal(second.status, '已掌握');
   assert.equal(second.state.learningReviews.length, 1);
   assert.equal(second.task.id, first.task.id);
+  assert.deepEqual(second.task.reviewPoints, []);
 });
 
 test('existing Feynman notes migrate to the latest child-scoped review status', () => {
@@ -88,4 +105,22 @@ test('existing Feynman notes migrate to the latest child-scoped review status', 
   assert.equal(migrated.learningReviews[0].explanation, '第二次已经讲清楚');
   assert.equal(migrated.learningReviews[0].aiScore, 90);
   assert.equal(migrated.learningReviews[0].status, '已掌握');
+  assert.deepEqual(migrated.learningReviews[0].reviewPoints, []);
+});
+
+test('legacy pending tasks gain review points from saved feedback', () => {
+  const state = {
+    ...stateWithChild(),
+    learningReviews: [{
+      id: 'r1', userId: 'u1', childId: 'c1', subject: '语文', topic: '观潮',
+      aiScore: 45, status: '需再次复习', unclear: '没有讲清时间顺序', unfamiliar: '生字读音'
+    }]
+  };
+
+  const migrated = migrateFeynmanNotesToReviewTasks(state);
+
+  assert.deepEqual(migrated.learningReviews[0].reviewPoints, [
+    '没有讲清时间顺序',
+    '生字读音'
+  ]);
 });

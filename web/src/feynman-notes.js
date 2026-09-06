@@ -1,4 +1,4 @@
-import { normalizeTextbookEvidence } from './learning-review.js';
+import { normalizeReviewPoints, normalizeTextbookEvidence } from './learning-review.js';
 
 const MASTERY_OPTIONS = ['不懂', '不熟', '能讲清'];
 
@@ -51,6 +51,7 @@ export function normalizeFeynmanNoteInput(input) {
       textbookId: String(input?.textbookId ?? '').trim(),
       textbookName: String(input?.textbookName ?? '').trim(),
       textbookEvidence: normalizeTextbookEvidence(input?.textbookEvidence),
+      reviewPoints: normalizeReviewPoints(input?.reviewPoints),
       reviewTaskId: String(input?.reviewTaskId ?? '').trim(),
       reviewStatus: String(input?.reviewStatus ?? '').trim()
     }

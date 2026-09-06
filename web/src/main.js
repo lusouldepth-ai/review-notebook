@@ -80,6 +80,7 @@ import {
   uploadTextbook
 } from './learning-ai-client.js';
 import {
+  buildFeynmanReviewPoints,
   listFeynmanReviewTasks,
   migrateFeynmanNotesToReviewTasks,
   resolveFeynmanMastery,
@@ -129,6 +130,8 @@ const aiLearningState = {
   basis: null,
   model: '',
   reviewTask: null,
+  pendingSave: null,
+  saveStatus: 'idle',
   textbookStatus: 'idle',
   textbookError: '',
   textbooks: [],
@@ -274,17 +277,18 @@ async function finishAccountLogin(result, successMessage) {
   try {
     const payload = buildAccountPayload(state);
     const databaseResult = await loginLocalAccount(payload);
-    const remoteReviewCount = Array.isArray(databaseResult.accountState?.learningReviews)
-      ? databaseResult.accountState.learningReviews.length
-      : 0;
+    const remoteLearningReviews = Array.isArray(databaseResult.accountState?.learningReviews)
+      ? databaseResult.accountState.learningReviews
+      : [];
     state = saveAppState(
       normalizeRuntimeState(mergeAccountState(state, databaseResult.accountState))
     );
     databaseState.status = 'synced';
     databaseState.revision = databaseResult.revision ?? null;
     databaseState.updatedAt = databaseResult.updatedAt ?? null;
-    const localReviewCount = extractAccountState(state, state.currentUserId)?.learningReviews.length ?? 0;
-    if (localReviewCount > remoteReviewCount) {
+    const localLearningReviews =
+      extractAccountState(state, state.currentUserId)?.learningReviews ?? [];
+    if (JSON.stringify(localLearningReviews) !== JSON.stringify(remoteLearningReviews)) {
       await queueAccountSave(state);
     }
     successMessage = databaseResult.created
@@ -380,14 +384,15 @@ async function synchronizeCurrentAccountOnStartup() {
   try {
     const result = await loginLocalAccount(payload);
     state = saveAppState(normalizeRuntimeState(mergeAccountState(state, result.accountState)));
-    const remoteReviewCount = Array.isArray(result.accountState?.learningReviews)
-      ? result.accountState.learningReviews.length
-      : 0;
-    const localReviewCount = extractAccountState(state, state.currentUserId)?.learningReviews.length ?? 0;
+    const remoteLearningReviews = Array.isArray(result.accountState?.learningReviews)
+      ? result.accountState.learningReviews
+      : [];
+    const localLearningReviews =
+      extractAccountState(state, state.currentUserId)?.learningReviews ?? [];
     databaseState.status = 'synced';
     databaseState.revision = result.revision ?? null;
     databaseState.updatedAt = result.updatedAt ?? null;
-    if (localReviewCount > remoteReviewCount) {
+    if (JSON.stringify(localLearningReviews) !== JSON.stringify(remoteLearningReviews)) {
       await queueAccountSave(state);
     }
     databaseState.status = 'synced';
@@ -410,6 +415,8 @@ function resetAiLearningState() {
   aiLearningState.basis = null;
   aiLearningState.model = '';
   aiLearningState.reviewTask = null;
+  aiLearningState.pendingSave = null;
+  aiLearningState.saveStatus = 'idle';
   aiLearningState.textbookStatus = 'idle';
   aiLearningState.textbookError = '';
   aiLearningState.textbooks = [];
@@ -875,8 +882,17 @@ function renderTextbookEvidence(evidence, title = '教材原文证据') {
   </section>`;
 }
 
-function renderAiEvaluationResult(evaluation, basis, reviewTask) {
+function renderReviewPointList(items) {
+  const points = Array.isArray(items) ? items.filter(Boolean) : [];
+  if (points.length === 0) return '';
+  return `<ul class="compact-list">${points
+    .map((item) => `<li>${escapeHtml(item)}</li>`)
+    .join('')}</ul>`;
+}
+
+function renderAiEvaluationResult(evaluation, basis, reviewTask, saveStatus = 'idle') {
   if (!evaluation) return '';
+  const isSaved = saveStatus === 'saved';
   const list = (items, emptyText) =>
     items.length > 0
       ? `<ul class="compact-list">${items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
@@ -905,9 +921,29 @@ function renderAiEvaluationResult(evaluation, basis, reviewTask) {
         ? `<section class="learning-route ${reviewTask.status === '已掌握' ? 'is-mastered' : 'needs-review'}">
             <div>
               <p class="eyebrow">本次学习状态</p>
-              <h3>${reviewTask.status === '已掌握' ? '已掌握，不进入待复习' : '已加入待复习'}</h3>
+              <h3>${
+                reviewTask.status === '已掌握'
+                  ? isSaved
+                    ? '已保存为已掌握'
+                    : '保存后记录为已掌握'
+                  : isSaved
+                    ? '已加入待复习'
+                    : '保存后加入待复习'
+              }</h3>
             </div>
             <strong>${escapeHtml(reviewTask.mastery)} · ${escapeHtml(reviewTask.aiScore)} 分</strong>
+          </section>`
+        : ''
+    }
+    ${
+      reviewTask
+        ? `<section class="review-points">
+            <h3>需要复习的要点</h3>
+            ${
+              reviewTask.reviewPoints?.length
+                ? list(reviewTask.reviewPoints, '')
+                : '<p class="hint">本次已达到掌握标准，没有需要加入复习队列的要点。</p>'
+            }
           </section>`
         : ''
     }
@@ -933,6 +969,18 @@ function renderAiEvaluationResult(evaluation, basis, reviewTask) {
       <p class="eyebrow">AI 学生还有一个问题</p>
       <h3>${escapeHtml(evaluation.followUpQuestion || '你能再举一个不同的例子吗？')}</h3>
     </section>
+    ${
+      reviewTask
+        ? `<div class="evaluation-save-bar">
+            <p class="hint">${
+              reviewTask.status === '已掌握'
+                ? '保存到当前孩子的学习记录。'
+                : `保存后将 ${reviewTask.reviewPoints.length} 个要点加入当前孩子的待复习。`
+            }</p>
+            <button type="button" id="save-feynman-evaluation-button" ${isSaved ? 'disabled' : ''}>${isSaved ? '已保存' : '保存本次结果'}</button>
+          </div>`
+        : ''
+    }
   </section>`;
 }
 
@@ -1667,6 +1715,8 @@ async function handleEvaluateFeynmanExplanation(event) {
   aiLearningState.evaluation = null;
   aiLearningState.basis = null;
   aiLearningState.reviewTask = null;
+  aiLearningState.pendingSave = null;
+  aiLearningState.saveStatus = 'idle';
   render('AI 正在对照教材听讲和评分...');
   try {
     const result = await evaluateFeynmanExplanation({
@@ -1684,33 +1734,40 @@ async function handleEvaluateFeynmanExplanation(event) {
     aiLearningState.model = result.model || '';
     const score = Number(result.evaluation.totalScore || 0);
     const mastery = resolveFeynmanMastery(score);
+    const reviewPoints = buildFeynmanReviewPoints(result.evaluation, score);
     const basisName =
       result.basis?.label || result.textbook?.filename || '通用知识评估';
+    const evaluatedAt = new Date();
+    const taskInput = {
+      childId: child.id,
+      subject: draft.subject,
+      topic: draft.topic,
+      explanation: draft.explanation,
+      score,
+      unclear: result.evaluation.unclear.join('；'),
+      unfamiliar: result.evaluation.unfamiliar.join('；'),
+      teachBetter: result.evaluation.teachBetter,
+      followUpQuestion: result.evaluation.followUpQuestion,
+      reviewPoints,
+      evidence: result.basis?.evidence
+    };
     const reviewTaskResult = upsertFeynmanReviewTask(
       state,
       user.id,
-      {
-        childId: child.id,
-        subject: draft.subject,
-        topic: draft.topic,
-        explanation: draft.explanation,
-        score,
-        unclear: result.evaluation.unclear.join('；'),
-        unfamiliar: result.evaluation.unfamiliar.join('；'),
-        teachBetter: result.evaluation.teachBetter,
-        followUpQuestion: result.evaluation.followUpQuestion,
-        evidence: result.basis?.evidence
-      },
-      new Date()
+      taskInput,
+      evaluatedAt
     );
     if (!reviewTaskResult.ok) {
       throw new Error(reviewTaskResult.error || '自动创建复习任务失败。');
     }
     aiLearningState.reviewTask = reviewTaskResult.task;
-    const noteResult = createFeynmanNote(
-      reviewTaskResult.state,
-      user.id,
-      {
+    aiLearningState.pendingSave = {
+      userId: user.id,
+      childId: child.id,
+      evaluatedAt: evaluatedAt.toISOString(),
+      draft: { ...draft },
+      taskInput,
+      noteInput: {
         childId: child.id,
         subject: draft.subject,
         concept: draft.topic,
@@ -1725,26 +1782,85 @@ async function handleEvaluateFeynmanExplanation(event) {
         textbookId: result.textbook?.id || '',
         textbookName: basisName,
         textbookEvidence: result.basis?.evidence,
-        reviewTaskId: reviewTaskResult.task.id,
-        reviewStatus: reviewTaskResult.status
-      },
-      new Date()
-    );
-    if (noteResult.ok) {
-      state = saveRuntimeState(noteResult.state);
-      writeAuditLog('feynman.ai_evaluation', 'success', `完成教材评估：${draft.topic}`);
-    }
-    render(
-      reviewTaskResult.status === '已掌握'
-        ? 'AI 已完成评分：本课已掌握，并已保存到当前孩子的数据库。'
-        : 'AI 已完成评分：本课已自动加入当前孩子的待复习队列。'
-    );
+        reviewPoints
+      }
+    };
+    aiLearningState.saveStatus = 'pending';
+    render('AI 已完成评分并生成复习要点，请确认后保存。');
   } catch (error) {
     aiLearningState.status = 'error';
     aiLearningState.error = error?.message || 'AI 评估失败。';
     writeAuditLog('feynman.ai_evaluation', 'failed', aiLearningState.error);
     render(aiLearningState.error);
   }
+}
+
+function handleSaveFeynmanEvaluation() {
+  const user = getCurrentUser();
+  const child = getCurrentChild();
+  const pending = aiLearningState.pendingSave;
+  if (!user || !child || !pending) {
+    render('当前没有可保存的 AI 评分结果。');
+    return;
+  }
+  if (pending.userId !== user.id || pending.childId !== child.id) {
+    resetAiLearningState();
+    render('孩子档案已经切换，请重新讲解并评分。');
+    return;
+  }
+
+  const form = document.getElementById('feynman-ai-form');
+  const currentDraft = form ? captureAiLearningDraft(form) : aiLearningState.draft;
+  const draftChanged = ['subject', 'topic', 'explanation'].some(
+    (key) => String(currentDraft[key] || '').trim() !== String(pending.draft[key] || '').trim()
+  );
+  if (draftChanged) {
+    aiLearningState.status = 'idle';
+    aiLearningState.evaluation = null;
+    aiLearningState.basis = null;
+    aiLearningState.reviewTask = null;
+    aiLearningState.pendingSave = null;
+    aiLearningState.saveStatus = 'idle';
+    render('讲解内容已修改，请重新请 AI 评分后再保存。');
+    return;
+  }
+
+  const savedAt = new Date(pending.evaluatedAt);
+  const reviewTaskResult = upsertFeynmanReviewTask(
+    state,
+    user.id,
+    pending.taskInput,
+    Number.isNaN(savedAt.getTime()) ? new Date() : savedAt
+  );
+  if (!reviewTaskResult.ok) {
+    render(reviewTaskResult.error || '保存复习状态失败。');
+    return;
+  }
+  const noteResult = createFeynmanNote(
+    reviewTaskResult.state,
+    user.id,
+    {
+      ...pending.noteInput,
+      reviewTaskId: reviewTaskResult.task.id,
+      reviewStatus: reviewTaskResult.status
+    },
+    Number.isNaN(savedAt.getTime()) ? new Date() : savedAt
+  );
+  if (!noteResult.ok) {
+    render(noteResult.error || '保存学习记录失败。');
+    return;
+  }
+
+  state = saveRuntimeState(noteResult.state);
+  aiLearningState.reviewTask = reviewTaskResult.task;
+  aiLearningState.pendingSave = null;
+  aiLearningState.saveStatus = 'saved';
+  writeAuditLog('feynman.ai_evaluation', 'success', `保存教材评估：${pending.draft.topic}`);
+  render(
+    reviewTaskResult.status === '已掌握'
+      ? '已保存：本课记录为已掌握。'
+      : `已保存：${reviewTaskResult.task.reviewPoints.length} 个要点已加入当前孩子的待复习。`
+  );
 }
 
 function handleOpenChildManagement() {
@@ -2569,6 +2685,11 @@ function renderUserHome(message) {
                 </div>
                 <p>${escapeHtml(note.explainSimply || '还没有写自己的解释。')}</p>
                 <p class="hint">没讲明白：${escapeHtml(note.stuckPoint || '—')} / 还不熟：${escapeHtml(note.unfamiliarPoint || '—')}</p>
+                ${
+                  note.reviewPoints?.length
+                    ? `<div class="saved-review-points"><strong>复习要点</strong>${renderReviewPointList(note.reviewPoints)}</div>`
+                    : ''
+                }
                 ${note.textbookName ? `<p class="hint">教材依据：${escapeHtml(note.textbookName)}</p>` : ''}
                 ${note.reviewStatus ? `<p class="hint">复习状态：${escapeHtml(note.reviewStatus)}</p>` : ''}
                 ${renderTextbookEvidence(note.textbookEvidence, '本次教材证据')}
@@ -2617,7 +2738,8 @@ function renderUserHome(message) {
                   <div>
                     <span>${escapeHtml(task.subject)} · ${escapeHtml(task.mastery)}</span>
                     <h3>${escapeHtml(task.topic)}</h3>
-                    <p class="hint">上次 ${escapeHtml(task.aiScore)} 分${task.unfamiliar ? ` · ${escapeHtml(task.unfamiliar)}` : ''}</p>
+                    <p class="hint">上次 ${escapeHtml(task.aiScore)} 分</p>
+                    ${task.reviewPoints?.length ? renderReviewPointList(task.reviewPoints.slice(0, 3)) : ''}
                   </div>
                   <button type="button" class="ghost resume-learning-review-button" data-task-id="${escapeHtml(task.id)}">再讲一次</button>
                 </article>`
@@ -3215,14 +3337,15 @@ function renderUserHome(message) {
         ${renderAiEvaluationResult(
           aiLearningState.evaluation,
           aiLearningState.basis,
-          aiLearningState.reviewTask
+          aiLearningState.reviewTask,
+          aiLearningState.saveStatus
         )}
       </section>
       <section class="panel note-list-panel">
         <div class="thread-head">
           <div>
             <h2>学习记录</h2>
-            <p class="hint">每次 AI 评分后自动保存，方便回看孩子表达和理解的变化。</p>
+            <p class="hint">AI 评分后点击保存，方便回看孩子表达和理解的变化。</p>
           </div>
           <form id="notebook-filter-form" class="mini-filter">
             <select name="subject">${renderNotebookSubjectOptions(uiState.noteSubjectFilter)}</select>
@@ -3553,6 +3676,8 @@ function renderUserHome(message) {
   textbookUploadForm?.addEventListener('submit', handleUploadTextbook);
   const feynmanAiForm = document.getElementById('feynman-ai-form');
   feynmanAiForm?.addEventListener('submit', handleEvaluateFeynmanExplanation);
+  const saveFeynmanEvaluationButton = document.getElementById('save-feynman-evaluation-button');
+  saveFeynmanEvaluationButton?.addEventListener('click', handleSaveFeynmanEvaluation);
   const feynmanStartRecordingButton = document.getElementById('feynman-start-recording-button');
   feynmanStartRecordingButton?.addEventListener('click', handleStartFeynmanRecording);
   const feynmanStopRecordingButton = document.getElementById('feynman-stop-recording-button');
