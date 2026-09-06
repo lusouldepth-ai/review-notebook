@@ -72,6 +72,11 @@ import {
 import { filterMistakesByRecentDays, summarizeWeakPoints } from './weak-points.js';
 import { loadAppState, saveAppState } from './storage.js';
 import { postImageForOcr } from './ocr-client.js';
+import {
+  evaluateFeynmanExplanation,
+  listTextbooks,
+  uploadTextbook
+} from './learning-ai-client.js';
 import { postAudioForTranscription, startAudioRecording } from './transcribe-client.js';
 
 const statusEl = document.getElementById('app-status');
@@ -89,12 +94,33 @@ function normalizeRuntimeState(rawState) {
 
 let state = saveAppState(normalizeRuntimeState(loadAppState()));
 let recorderController = null;
+let feynmanRecorderController = null;
 let reminderTimerId = null;
 const voiceState = {
   status: 'idle',
   text: '',
   engine: '',
   error: ''
+};
+const feynmanVoiceState = {
+  status: 'idle',
+  error: ''
+};
+const aiLearningState = {
+  status: 'idle',
+  error: '',
+  evaluation: null,
+  basis: null,
+  model: '',
+  textbookStatus: 'idle',
+  textbookError: '',
+  textbooks: [],
+  contextKey: '',
+  draft: {
+    subject: '数学',
+    topic: '',
+    explanation: ''
+  }
 };
 const uiState = {
   activeWorkspace: 'review',
@@ -130,8 +156,9 @@ const voiceStatusTextMap = {
 };
 
 function setStatusNotice(message = '') {
-  const base = '本地模式：手机号/邮箱登录 + 开源语音转写 + 本地提醒';
-  statusEl.textContent = message ? `${base} | ${message}` : base;
+  if (statusEl) {
+    statusEl.textContent = message;
+  }
 }
 
 function getCurrentUser() {
@@ -230,12 +257,33 @@ function handleSavedAccountLogin(event) {
 
 function handleLogout() {
   recorderController = null;
+  feynmanRecorderController = null;
   voiceState.status = 'idle';
   voiceState.text = '';
   voiceState.engine = '';
   voiceState.error = '';
+  feynmanVoiceState.status = 'idle';
+  feynmanVoiceState.error = '';
+  resetAiLearningState();
   state = saveAppState(logoutWithLocalState(state));
   render('已退出登录。');
+}
+
+function resetAiLearningState() {
+  aiLearningState.status = 'idle';
+  aiLearningState.error = '';
+  aiLearningState.evaluation = null;
+  aiLearningState.basis = null;
+  aiLearningState.model = '';
+  aiLearningState.textbookStatus = 'idle';
+  aiLearningState.textbookError = '';
+  aiLearningState.textbooks = [];
+  aiLearningState.contextKey = '';
+  aiLearningState.draft = {
+    subject: '数学',
+    topic: '',
+    explanation: ''
+  };
 }
 
 async function handleStartRecording() {
@@ -397,7 +445,10 @@ function handleCreateChild(event) {
   }
 
   state = saveAppState(result.state);
-  render(`孩子档案已创建：${result.child.name}`);
+  uiState.activeWorkspace = 'notebook';
+  resetAiLearningState();
+  render(`孩子档案已创建：${result.child.name}。现在可以上传教材并开始讲给 AI 听。`);
+  void refreshTextbooksForCurrentChild();
 }
 
 function handleSwitchChild(event) {
@@ -414,7 +465,11 @@ function handleSwitchChild(event) {
   uiState.listVisibleCount = MISTAKE_LIST_PAGE_SIZE;
   uiState.selectedMistakeId = null;
   uiState.editingMistakeId = null;
+  resetAiLearningState();
   render('已切换当前孩子。');
+  if (uiState.activeWorkspace === 'notebook') {
+    void refreshTextbooksForCurrentChild();
+  }
 }
 
 function summarizeDuplicateCandidates(candidates) {
@@ -633,6 +688,83 @@ function renderChildrenOptions(children, selectedChildId) {
         `<option value="${child.id}" ${child.id === selectedChildId ? 'selected' : ''}>${child.name}（${child.grade}）</option>`
     )
     .join('');
+}
+
+function renderGradeOptions(selectedGrade = '一年级') {
+  return ['一年级', '二年级', '三年级', '四年级', '五年级', '六年级']
+    .map(
+      (grade) =>
+        `<option value="${grade}" ${grade === selectedGrade ? 'selected' : ''}>${grade}</option>`
+    )
+    .join('');
+}
+
+function renderChildProfileForm() {
+  return `<form id="child-form" class="form-grid top-gap">
+    <div class="two-col-grid">
+      <label>
+        孩子姓名或昵称
+        <input name="name" type="text" placeholder="例如 小明" required />
+      </label>
+      <label>
+        年级
+        <select name="grade">${renderGradeOptions()}</select>
+      </label>
+    </div>
+    <input name="stage" type="hidden" value="小学" />
+    <fieldset class="fieldset-inline">
+      <legend>学习科目</legend>
+      <label class="checkbox-line"><input type="checkbox" name="subjects" value="语文" checked />语文</label>
+      <label class="checkbox-line"><input type="checkbox" name="subjects" value="数学" checked />数学</label>
+      <label class="checkbox-line"><input type="checkbox" name="subjects" value="英语" checked />英语</label>
+    </fieldset>
+    <button type="submit">建立孩子档案</button>
+  </form>`;
+}
+
+function renderAiEvaluationResult(evaluation, basis) {
+  if (!evaluation) return '';
+  const list = (items, emptyText) =>
+    items.length > 0
+      ? `<ul class="compact-list">${items.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+      : `<p class="hint">${emptyText}</p>`;
+  return `<section class="ai-evaluation-result" aria-live="polite">
+    <div class="ai-score-head">
+      <div class="ai-total-score"><strong>${escapeHtml(evaluation.totalScore)}</strong><span>综合得分</span></div>
+      <div>
+        <h3>${escapeHtml(evaluation.summary || 'AI 已完成教材对照评估')}</h3>
+        <p class="hint">${escapeHtml(basis?.label || '本次评分依据已记录。')}</p>
+      </div>
+    </div>
+    <div class="ai-dimension-grid">
+      <span>知识准确 <strong>${escapeHtml(evaluation.dimensions.accuracy)}</strong></span>
+      <span>内容完整 <strong>${escapeHtml(evaluation.dimensions.completeness)}</strong></span>
+      <span>表达清楚 <strong>${escapeHtml(evaluation.dimensions.clarity)}</strong></span>
+      <span>能教会人 <strong>${escapeHtml(evaluation.dimensions.teaching)}</strong></span>
+    </div>
+    <div class="ai-feedback-grid">
+      <section>
+        <h3>已经讲明白</h3>
+        ${list(evaluation.understood, '这次还没有识别出稳定掌握的部分。')}
+      </section>
+      <section>
+        <h3>没讲明白</h3>
+        ${list(evaluation.unclear, '没有发现明显讲错或遗漏。')}
+      </section>
+      <section>
+        <h3>还不熟</h3>
+        ${list(evaluation.unfamiliar, '没有发现明显不熟练的部分。')}
+      </section>
+    </div>
+    <section class="ai-teach-better">
+      <h3>如果教别人，可以这样讲</h3>
+      <p>${escapeHtml(evaluation.teachBetter || '继续用自己的话，加上一个具体例子。')}</p>
+    </section>
+    <section class="ai-follow-up">
+      <p class="eyebrow">AI 学生还有一个问题</p>
+      <h3>${escapeHtml(evaluation.followUpQuestion || '你能再举一个不同的例子吗？')}</h3>
+    </section>
+  </section>`;
 }
 
 function renderSubjectOptions(selectedSubject = '语文') {
@@ -962,6 +1094,9 @@ function handleSwitchWorkspace(event) {
     }
   }
   render();
+  if (workspace === 'notebook' && aiLearningState.contextKey !== getAiLearningContextKey()) {
+    void refreshTextbooksForCurrentChild();
+  }
 }
 
 function handleCancelEditMistake() {
@@ -1182,40 +1317,218 @@ function handleWeakPointFormSubmit(event) {
   render('薄弱点归纳已刷新。');
 }
 
-function handleCreateFeynmanNote(event) {
+function getAiLearningContextKey() {
+  const user = getCurrentUser();
+  const child = getCurrentChild();
+  return user && child ? `${user.id}:${child.id}` : '';
+}
+
+async function refreshTextbooksForCurrentChild() {
+  const user = getCurrentUser();
+  const child = getCurrentChild();
+  if (!user || !child) return;
+  const contextKey = getAiLearningContextKey();
+  aiLearningState.contextKey = contextKey;
+  aiLearningState.textbookStatus = 'loading';
+  aiLearningState.textbookError = '';
+  render();
+  try {
+    const textbooks = await listTextbooks({
+      userId: user.id,
+      childId: child.id,
+      grade: child.grade
+    });
+    if (getAiLearningContextKey() !== contextKey) return;
+    aiLearningState.textbooks = textbooks;
+    aiLearningState.textbookStatus = 'ready';
+    render();
+  } catch (error) {
+    if (getAiLearningContextKey() !== contextKey) return;
+    aiLearningState.textbookStatus = 'error';
+    aiLearningState.textbookError = error?.message || '教材列表加载失败。';
+    render();
+  }
+}
+
+function captureAiLearningDraft(form) {
+  const data = new FormData(form);
+  aiLearningState.draft = {
+    subject: String(data.get('subject') || '数学'),
+    topic: String(data.get('topic') || ''),
+    explanation: String(data.get('explanation') || '')
+  };
+  return aiLearningState.draft;
+}
+
+async function handleUploadTextbook(event) {
   event.preventDefault();
   const user = getCurrentUser();
-  if (!user) {
-    render('请先登录。');
+  const child = getCurrentChild();
+  if (!user || !child) {
+    render('请先建立孩子档案。');
     return;
   }
   const form = new FormData(event.currentTarget);
-  const result = createFeynmanNote(
-    state,
-    user.id,
-    {
+  const file = form.get('textbookFile');
+  if (!(file instanceof File) || file.size === 0) {
+    render('请选择 PDF、TXT 或 Markdown 教材。');
+    return;
+  }
+  aiLearningState.textbookStatus = 'uploading';
+  aiLearningState.textbookError = '';
+  render();
+  try {
+    const result = await uploadTextbook({
+      userId: user.id,
+      childId: child.id,
       subject: form.get('subject'),
-      concept: form.get('concept'),
-      mastery: form.get('mastery'),
-      explainSimply: form.get('explainSimply'),
-      teachBack: form.get('teachBack'),
-      stuckPoint: form.get('stuckPoint'),
-      unfamiliarPoint: form.get('unfamiliarPoint'),
-      example: form.get('example'),
-      relatedMistakeId: form.get('relatedMistakeId')
-    },
-    new Date()
-  );
+      grade: child.grade,
+      file
+    });
+    aiLearningState.draft.subject = String(form.get('subject') || '数学');
+    writeAuditLog('textbook.upload', 'success', `教材已添加：${result.textbook.filename}`);
+    await refreshTextbooksForCurrentChild();
+    render('教材已添加，AI 评估将只使用相关教材片段。');
+  } catch (error) {
+    aiLearningState.textbookStatus = 'error';
+    aiLearningState.textbookError = error?.message || '教材上传失败。';
+    render(aiLearningState.textbookError);
+  }
+}
 
-  if (!result.ok) {
-    render(result.error);
+async function handleStartFeynmanRecording() {
+  if (feynmanVoiceState.status === 'recording' || feynmanVoiceState.status === 'processing') {
+    return;
+  }
+  const form = document.getElementById('feynman-ai-form');
+  if (form) captureAiLearningDraft(form);
+  feynmanVoiceState.status = 'recording';
+  feynmanVoiceState.error = '';
+  const startButton = document.getElementById('feynman-start-recording-button');
+  const stopButton = document.getElementById('feynman-stop-recording-button');
+  const status = document.getElementById('feynman-voice-status');
+  if (startButton) startButton.disabled = true;
+  if (stopButton) stopButton.disabled = false;
+  if (status) status.textContent = '正在听孩子讲...';
+  try {
+    feynmanRecorderController = await startAudioRecording();
+  } catch (error) {
+    feynmanRecorderController = null;
+    feynmanVoiceState.status = 'idle';
+    feynmanVoiceState.error = error?.message || '启动录音失败。';
+    if (startButton) startButton.disabled = false;
+    if (stopButton) stopButton.disabled = true;
+    if (status) status.textContent = feynmanVoiceState.error;
+  }
+}
+
+async function handleStopFeynmanRecording() {
+  if (!feynmanRecorderController || feynmanVoiceState.status !== 'recording') return;
+  feynmanVoiceState.status = 'processing';
+  const stopButton = document.getElementById('feynman-stop-recording-button');
+  const startButton = document.getElementById('feynman-start-recording-button');
+  const status = document.getElementById('feynman-voice-status');
+  if (stopButton) stopButton.disabled = true;
+  if (status) status.textContent = '正在整理刚才的讲解...';
+  try {
+    const blob = await feynmanRecorderController.stop();
+    feynmanRecorderController = null;
+    const result = await postAudioForTranscription(blob);
+    const field = document.getElementById('feynman-explanation');
+    if (field) {
+      field.value = [field.value.trim(), String(result.text || '').trim()].filter(Boolean).join('\n');
+      aiLearningState.draft.explanation = field.value;
+    }
+    feynmanVoiceState.status = 'done';
+    if (status) status.textContent = '讲解已转成文字，可以继续补充或请 AI 评分。';
+  } catch (error) {
+    feynmanRecorderController = null;
+    feynmanVoiceState.status = 'idle';
+    feynmanVoiceState.error = error?.message || '语音转写失败。';
+    if (status) status.textContent = feynmanVoiceState.error;
+  } finally {
+    if (startButton) startButton.disabled = false;
+  }
+}
+
+async function handleEvaluateFeynmanExplanation(event) {
+  event.preventDefault();
+  const user = getCurrentUser();
+  const child = getCurrentChild();
+  if (!user || !child) {
+    render('请先建立孩子档案。');
+    return;
+  }
+  const draft = captureAiLearningDraft(event.currentTarget);
+  if (!draft.topic.trim() || !draft.explanation.trim()) {
+    render('请填写知识点和孩子的讲解。');
     return;
   }
 
-  state = saveRuntimeState(result.state);
-  uiState.activeWorkspace = 'notebook';
-  writeAuditLog('feynman_note.create', 'success', `新增笔记：${result.note.concept}`);
-  render('费曼笔记已保存。');
+  aiLearningState.status = 'processing';
+  aiLearningState.error = '';
+  aiLearningState.evaluation = null;
+  aiLearningState.basis = null;
+  render('AI 正在对照教材听讲和评分...');
+  try {
+    const result = await evaluateFeynmanExplanation({
+      userId: user.id,
+      childId: child.id,
+      grade: child.grade,
+      subject: draft.subject,
+      topic: draft.topic,
+      explanation: draft.explanation,
+      textbookId: ''
+    });
+    aiLearningState.status = 'done';
+    aiLearningState.evaluation = result.evaluation;
+    aiLearningState.basis = result.basis || null;
+    aiLearningState.model = result.model || '';
+    const score = Number(result.evaluation.totalScore || 0);
+    const mastery = score >= 85 ? '能讲清' : score >= 60 ? '不熟' : '不懂';
+    const basisName =
+      result.basis?.label || result.textbook?.filename || '通用知识评估';
+    const noteResult = createFeynmanNote(
+      state,
+      user.id,
+      {
+        childId: child.id,
+        subject: draft.subject,
+        concept: draft.topic,
+        mastery,
+        explainSimply: draft.explanation,
+        stuckPoint: result.evaluation.unclear.join('；'),
+        unfamiliarPoint: result.evaluation.unfamiliar.join('；'),
+        teachBack: result.evaluation.teachBetter,
+        example: result.evaluation.evidence.join('；'),
+        aiScore: score,
+        aiAssessment: result.evaluation,
+        textbookId: result.textbook?.id || '',
+        textbookName: basisName
+      },
+      new Date()
+    );
+    if (noteResult.ok) {
+      state = saveRuntimeState(noteResult.state);
+      writeAuditLog('feynman.ai_evaluation', 'success', `完成教材评估：${draft.topic}`);
+    }
+    render('AI 已完成评分，结果已自动保存到学习记录。');
+  } catch (error) {
+    aiLearningState.status = 'error';
+    aiLearningState.error = error?.message || 'AI 评估失败。';
+    writeAuditLog('feynman.ai_evaluation', 'failed', aiLearningState.error);
+    render(aiLearningState.error);
+  }
+}
+
+function handleOpenChildManagement() {
+  uiState.activeWorkspace = 'capture';
+  render();
+  const panel = document.getElementById('child-management-panel');
+  if (panel) {
+    panel.open = true;
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
 }
 
 function handleReviewFeynmanNote(event) {
@@ -1249,6 +1562,8 @@ function handleReviewFeynmanNote(event) {
 
 function handleNotebookFilterSubmit(event) {
   event.preventDefault();
+  const aiForm = document.getElementById('feynman-ai-form');
+  if (aiForm) captureAiLearningDraft(aiForm);
   const form = new FormData(event.currentTarget);
   uiState.noteSubjectFilter = String(form.get('subject') ?? 'all').trim() || 'all';
   uiState.noteMasteryFilter = String(form.get('mastery') ?? 'all').trim() || 'all';
@@ -1891,6 +2206,7 @@ function renderUserHome(message) {
     : [];
   const currentWeakPointViews = (state.weakPointViews || []).filter((item) => item.userId === user.id);
   const feynmanNotes = listFeynmanNotesForUser(state, user.id, {
+    childId: currentChildId || 'all',
     subject: uiState.noteSubjectFilter,
     mastery: uiState.noteMasteryFilter
   });
@@ -2019,9 +2335,11 @@ function renderUserHome(message) {
                   <span>${escapeHtml(note.subject)}</span>
                   <strong>${escapeHtml(note.concept)}</strong>
                   <em>${escapeHtml(note.mastery)}</em>
+                  ${Number.isFinite(Number(note.aiScore)) ? `<em class="note-score">AI ${escapeHtml(note.aiScore)} 分</em>` : ''}
                 </div>
                 <p>${escapeHtml(note.explainSimply || '还没有写自己的解释。')}</p>
-                <p class="hint">不懂：${escapeHtml(note.stuckPoint || '—')} / 不熟：${escapeHtml(note.unfamiliarPoint || '—')}</p>
+                <p class="hint">没讲明白：${escapeHtml(note.stuckPoint || '—')} / 还不熟：${escapeHtml(note.unfamiliarPoint || '—')}</p>
+                ${note.textbookName ? `<p class="hint">教材依据：${escapeHtml(note.textbookName)}</p>` : ''}
                 <details class="advanced-block">
                   <summary>补一条复习记录</summary>
                   <form class="feynman-review-form form-grid top-gap">
@@ -2313,7 +2631,9 @@ function renderUserHome(message) {
   const exportRange = getCurrentExportRange();
   const lockExportRange = shouldLockExportDateInputs();
   const workspaceOptions = ['review', 'capture', 'notebook', 'insight', 'export', 'settings'];
-  const workspace = workspaceOptions.includes(uiState.activeWorkspace)
+  const workspace = children.length === 0
+    ? 'capture'
+    : workspaceOptions.includes(uiState.activeWorkspace)
     ? uiState.activeWorkspace
     : 'review';
   uiState.activeWorkspace = workspace;
@@ -2330,23 +2650,25 @@ function renderUserHome(message) {
         <div class="brand-mark">
           <span></span>
           <div>
-            <p class="eyebrow">LOCAL STUDY</p>
             <h2>错题本</h2>
           </div>
         </div>
-        <label class="inline-field">
-          当前孩子
-          <select id="child-switcher" ${children.length === 0 ? 'disabled' : ''}>
-            ${renderChildrenOptions(children, currentChildId)}
-          </select>
-        </label>
+        <div class="child-switcher-block">
+          <span class="field-label">当前孩子</span>
+          ${
+            children.length === 0
+              ? '<button type="button" id="create-first-child-button">建立第一个孩子档案</button>'
+              : `<select id="child-switcher">${renderChildrenOptions(children, currentChildId)}</select>
+                 <button type="button" id="manage-child-button" class="ghost compact-button">新增或管理孩子</button>`
+          }
+        </div>
         <nav class="workspace-tabs">
-          <button type="button" class="workspace-tab ${isReviewWorkspace ? 'active' : ''}" data-workspace="review">复习</button>
-          <button type="button" class="workspace-tab ${isCaptureWorkspace ? 'active' : ''}" data-workspace="capture">录入</button>
-          <button type="button" class="workspace-tab ${isNotebookWorkspace ? 'active' : ''}" data-workspace="notebook">笔记本</button>
-          <button type="button" class="workspace-tab ${isInsightWorkspace ? 'active' : ''}" data-workspace="insight">薄弱点</button>
-          <button type="button" class="workspace-tab ${isExportWorkspace ? 'active' : ''}" data-workspace="export">导出</button>
-          <button type="button" class="workspace-tab ${isSettingsWorkspace ? 'active' : ''}" data-workspace="settings">设置</button>
+          <button type="button" class="workspace-tab ${isReviewWorkspace ? 'active' : ''}" data-workspace="review" ${children.length === 0 ? 'disabled' : ''}>复习</button>
+          <button type="button" class="workspace-tab ${isCaptureWorkspace ? 'active' : ''}" data-workspace="capture" ${children.length === 0 ? 'disabled' : ''}>录入</button>
+          <button type="button" class="workspace-tab ${isNotebookWorkspace ? 'active' : ''}" data-workspace="notebook" ${children.length === 0 ? 'disabled' : ''}>讲给 AI</button>
+          <button type="button" class="workspace-tab ${isInsightWorkspace ? 'active' : ''}" data-workspace="insight" ${children.length === 0 ? 'disabled' : ''}>薄弱点</button>
+          <button type="button" class="workspace-tab ${isExportWorkspace ? 'active' : ''}" data-workspace="export" ${children.length === 0 ? 'disabled' : ''}>导出</button>
+          <button type="button" class="workspace-tab ${isSettingsWorkspace ? 'active' : ''}" data-workspace="settings" ${children.length === 0 ? 'disabled' : ''}>设置</button>
         </nav>
         <div class="rail-stats">
           <span>孩子 ${children.length}</span>
@@ -2371,7 +2693,20 @@ function renderUserHome(message) {
           ${message ? `<p class="success">${message}</p>` : ''}
         </header>
 
-    <section class="workspace-panel ${isCaptureWorkspace ? '' : 'is-hidden'} top-gap">
+    ${
+      children.length === 0
+        ? `<section class="workspace-panel child-onboarding top-gap">
+            <section class="panel onboarding-panel">
+              <p class="eyebrow">第一步</p>
+              <h2>建立孩子档案</h2>
+              <p class="hint">选择孩子当前年级和学习科目。建立后，就能上传对应教材、录入错题并让孩子讲给 AI 听。</p>
+              ${renderChildProfileForm()}
+            </section>
+          </section>`
+        : ''
+    }
+
+    <section class="workspace-panel ${isCaptureWorkspace && children.length > 0 ? '' : 'is-hidden'} top-gap">
       <section class="panel">
         <h2>步骤 1｜录入错题</h2>
         <p class="hint">先填核心字段，其他内容放到展开项，保证录入路径短而稳定。</p>
@@ -2496,38 +2831,14 @@ function renderUserHome(message) {
         </div>
       </section>
 
-      <details class="panel top-gap details-panel">
-        <summary>孩子档案管理（可选）</summary>
-        <form id="child-form" class="form-grid top-gap">
-          <div class="two-col-grid">
-            <label>
-              孩子姓名/昵称
-              <input name="name" type="text" placeholder="例如 小明" required />
-            </label>
-            <label>
-              年级
-              <input name="grade" type="text" placeholder="例如 三年级" required />
-            </label>
-          </div>
-          <div class="two-col-grid">
-            <label>
-              学校阶段
-              <select name="stage">
-                <option value="小学">小学</option>
-                <option value="初中">初中</option>
-                <option value="高中">高中</option>
-              </select>
-            </label>
-            <fieldset class="fieldset-inline">
-              <legend>默认学科</legend>
-              <label class="checkbox-line"><input type="checkbox" name="subjects" value="语文" checked />语文</label>
-              <label class="checkbox-line"><input type="checkbox" name="subjects" value="数学" checked />数学</label>
-              <label class="checkbox-line"><input type="checkbox" name="subjects" value="英语" checked />英语</label>
-            </fieldset>
-          </div>
-          <button type="submit">新增孩子档案</button>
-        </form>
-      </details>
+      ${
+        children.length > 0
+          ? `<details id="child-management-panel" class="panel top-gap details-panel">
+              <summary>新增孩子档案</summary>
+              ${renderChildProfileForm()}
+            </details>`
+          : ''
+      }
     </section>
 
     <section class="workspace-panel ${isReviewWorkspace ? '' : 'is-hidden'} top-gap">
@@ -2587,11 +2898,65 @@ function renderUserHome(message) {
     </section>
 
     <section class="workspace-panel ${isNotebookWorkspace ? '' : 'is-hidden'} top-gap">
-      <section class="panel notebook-lab">
+      <section class="panel ai-learning-lab">
         <div class="thread-head">
           <div>
-            <p class="eyebrow">FEYNMAN NOTEBOOK</p>
-            <h2>费曼笔记本</h2>
+            <p class="eyebrow">孩子当老师，AI 当学生</p>
+            <h2>把今天学会的内容讲给 AI 听</h2>
+            <p class="hint">AI 会先检索当前年级的对应教材，判断哪里讲明白了、哪里没讲清、哪里还不熟。</p>
+          </div>
+        </div>
+
+        <section class="textbook-scope">
+          <div>
+            <h3>后台教材库</h3>
+            <p class="hint">当前年级已配置 ${aiLearningState.textbooks.filter((item) => item.builtIn).length} 本系统教材。AI 会先自动检索，未命中时才使用通用知识。</p>
+          </div>
+          <details class="advanced-block">
+            <summary>添加家庭补充教材（可选）</summary>
+            <form id="textbook-upload-form" class="textbook-upload-form top-gap">
+              <select name="subject" aria-label="教材学科">${renderSubjectOptions(aiLearningState.draft.subject)}</select>
+              <input name="textbookFile" type="file" accept="application/pdf,text/plain,text/markdown,.pdf,.txt,.md" aria-label="选择教材文件" required />
+              <button type="submit" class="ghost" ${aiLearningState.textbookStatus === 'uploading' ? 'disabled' : ''}>${aiLearningState.textbookStatus === 'uploading' ? '正在读取教材...' : '添加教材'}</button>
+            </form>
+          </details>
+          ${aiLearningState.textbookError ? `<p class="error">${escapeHtml(aiLearningState.textbookError)}</p>` : ''}
+        </section>
+
+        <form id="feynman-ai-form" class="feynman-board">
+          <label>
+            学科
+            <select name="subject">${renderSubjectOptions(aiLearningState.draft.subject)}</select>
+          </label>
+          <label>
+            今天要讲的知识点
+            <input name="topic" type="text" value="${escapeHtml(aiLearningState.draft.topic)}" placeholder="例如：分数表示什么" required />
+          </label>
+          <div class="ai-teach-box">
+            <label for="feynman-explanation">现在你是老师，请用自己的话讲给 AI 学生听</label>
+            <textarea id="feynman-explanation" name="explanation" rows="8" placeholder="可以直接讲，也可以先输入文字。尽量说清楚：它是什么、为什么、怎么用，再举一个例子。" required>${escapeHtml(aiLearningState.draft.explanation)}</textarea>
+            <div class="action-row">
+              <button type="button" id="feynman-start-recording-button" class="ghost" ${feynmanVoiceState.status === 'recording' || feynmanVoiceState.status === 'processing' ? 'disabled' : ''}>开始讲</button>
+              <button type="button" id="feynman-stop-recording-button" class="ghost" ${feynmanVoiceState.status !== 'recording' ? 'disabled' : ''}>讲完了</button>
+              <p id="feynman-voice-status" class="hint">${
+                feynmanVoiceState.status === 'recording'
+                  ? '正在听孩子讲...'
+                  : feynmanVoiceState.status === 'processing'
+                    ? '正在整理刚才的讲解...'
+                    : feynmanVoiceState.error || '可以语音讲解，也可以直接输入文字。'
+              }</p>
+            </div>
+          </div>
+          <button type="submit" ${aiLearningState.status === 'processing' ? 'disabled' : ''}>${aiLearningState.status === 'processing' ? 'AI 正在听讲和评分...' : '请 AI 听讲并打分'}</button>
+        </form>
+        ${aiLearningState.error ? `<p class="error">${escapeHtml(aiLearningState.error)}</p>` : ''}
+        ${renderAiEvaluationResult(aiLearningState.evaluation, aiLearningState.basis)}
+      </section>
+      <section class="panel note-list-panel">
+        <div class="thread-head">
+          <div>
+            <h2>学习记录</h2>
+            <p class="hint">每次 AI 评分后自动保存，方便回看孩子表达和理解的变化。</p>
           </div>
           <form id="notebook-filter-form" class="mini-filter">
             <select name="subject">${renderNotebookSubjectOptions(uiState.noteSubjectFilter)}</select>
@@ -2599,49 +2964,6 @@ function renderUserHome(message) {
             <button type="submit" class="ghost">筛选</button>
           </form>
         </div>
-        <form id="feynman-note-form" class="feynman-board">
-          <div class="two-col-grid">
-            <label>
-              学科
-              <select name="subject">${renderSubjectOptions(currentChild ? '数学' : '语文')}</select>
-            </label>
-            <label>
-              掌握度
-              <select name="mastery">${renderFeynmanMasteryOptions('不熟')}</select>
-            </label>
-          </div>
-          <label>
-            知识点
-            <input name="concept" type="text" placeholder="例如 单位、形近字、时态" required />
-          </label>
-          <label>
-            用孩子能听懂的话讲一遍
-            <textarea name="explainSimply" rows="4"></textarea>
-          </label>
-          <div class="two-col-grid">
-            <label>
-              不懂在哪里
-              <textarea name="stuckPoint" rows="3"></textarea>
-            </label>
-            <label>
-              不熟在哪里
-              <textarea name="unfamiliarPoint" rows="3"></textarea>
-            </label>
-          </div>
-          <label>
-            如果要教别人，我会怎么讲
-            <textarea name="teachBack" rows="4"></textarea>
-          </label>
-          <label>
-            例子或反例
-            <textarea name="example" rows="3"></textarea>
-          </label>
-          <input name="relatedMistakeId" type="hidden" value="${escapeHtml(selectedMistake?.id || '')}" />
-          <button type="submit">保存笔记</button>
-        </form>
-      </section>
-      <section class="panel note-list-panel">
-        <h2>笔记流</h2>
         ${feynmanNoteRows}
       </section>
     </section>
@@ -2901,6 +3223,12 @@ function renderUserHome(message) {
   });
   const childSwitcher = document.getElementById('child-switcher');
   childSwitcher?.addEventListener('change', handleSwitchChild);
+  const createFirstChildButton = document.getElementById('create-first-child-button');
+  createFirstChildButton?.addEventListener('click', () => {
+    document.querySelector('#child-form input[name="name"]')?.focus();
+  });
+  const manageChildButton = document.getElementById('manage-child-button');
+  manageChildButton?.addEventListener('click', handleOpenChildManagement);
   const childForm = document.getElementById('child-form');
   childForm?.addEventListener('submit', handleCreateChild);
   const startRecordingButton = document.getElementById('start-recording-button');
@@ -2952,8 +3280,14 @@ function renderUserHome(message) {
   deleteMistakeButton?.addEventListener('click', handleDeleteMistake);
   const weakPointForm = document.getElementById('weak-point-form');
   weakPointForm?.addEventListener('submit', handleWeakPointFormSubmit);
-  const feynmanNoteForm = document.getElementById('feynman-note-form');
-  feynmanNoteForm?.addEventListener('submit', handleCreateFeynmanNote);
+  const textbookUploadForm = document.getElementById('textbook-upload-form');
+  textbookUploadForm?.addEventListener('submit', handleUploadTextbook);
+  const feynmanAiForm = document.getElementById('feynman-ai-form');
+  feynmanAiForm?.addEventListener('submit', handleEvaluateFeynmanExplanation);
+  const feynmanStartRecordingButton = document.getElementById('feynman-start-recording-button');
+  feynmanStartRecordingButton?.addEventListener('click', handleStartFeynmanRecording);
+  const feynmanStopRecordingButton = document.getElementById('feynman-stop-recording-button');
+  feynmanStopRecordingButton?.addEventListener('click', handleStopFeynmanRecording);
   const notebookFilterForm = document.getElementById('notebook-filter-form');
   notebookFilterForm?.addEventListener('submit', handleNotebookFilterSubmit);
   document.querySelectorAll('.feynman-review-form').forEach((form) => {

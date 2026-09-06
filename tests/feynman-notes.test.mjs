@@ -16,6 +16,7 @@ test('normalizeFeynmanNoteInput requires a concept and keeps learning fields', (
   assert.equal(invalid.ok, false);
 
   const valid = normalizeFeynmanNoteInput({
+    childId: 'c1',
     subject: '数学',
     concept: '单位',
     explainSimply: '答案要带单位',
@@ -29,6 +30,7 @@ test('normalizeFeynmanNoteInput requires a concept and keeps learning fields', (
   assert.equal(valid.ok, true);
   assert.equal(valid.note.concept, '单位');
   assert.equal(valid.note.mastery, '不熟');
+  assert.equal(valid.note.childId, 'c1');
 });
 
 test('createFeynmanNote stores user note and links related mistake', () => {
@@ -78,4 +80,23 @@ test('listFeynmanNotesForUser sorts newest updated notes first', () => {
 
   const notes = listFeynmanNotesForUser(state, 'u1');
   assert.deepEqual(notes.map((note) => note.concept), ['形近字', '单位']);
+});
+
+test('listFeynmanNotesForUser can isolate notes by child', () => {
+  let state = createEmptyState();
+  state = createFeynmanNote(state, 'u1', {
+    childId: 'c1',
+    subject: '数学',
+    concept: '分数',
+    explainSimply: '分数表示整体的一部分'
+  }, NOW).state;
+  state = createFeynmanNote(state, 'u1', {
+    childId: 'c2',
+    subject: '语文',
+    concept: '比喻句',
+    explainSimply: '把一种事物比作另一种事物'
+  }, new Date('2026-05-18T10:00:00.000Z')).state;
+
+  const notes = listFeynmanNotesForUser(state, 'u1', { childId: 'c1' });
+  assert.deepEqual(notes.map((note) => note.concept), ['分数']);
 });

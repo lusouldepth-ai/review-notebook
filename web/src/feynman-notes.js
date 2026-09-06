@@ -29,6 +29,7 @@ export function normalizeFeynmanNoteInput(input) {
   return {
     ok: true,
     note: {
+      childId: String(input?.childId ?? '').trim(),
       subject: String(input?.subject ?? '未分类').trim() || '未分类',
       concept,
       explainSimply: String(input?.explainSimply ?? '').trim(),
@@ -37,7 +38,16 @@ export function normalizeFeynmanNoteInput(input) {
       unfamiliarPoint,
       example: String(input?.example ?? '').trim(),
       relatedMistakeId: String(input?.relatedMistakeId ?? '').trim(),
-      mastery: normalizeMastery(input?.mastery, '不熟')
+      mastery: normalizeMastery(input?.mastery, '不熟'),
+      aiScore: Number.isFinite(Number(input?.aiScore))
+        ? Math.max(0, Math.min(100, Math.round(Number(input.aiScore))))
+        : null,
+      aiAssessment:
+        input?.aiAssessment && typeof input.aiAssessment === 'object'
+          ? input.aiAssessment
+          : null,
+      textbookId: String(input?.textbookId ?? '').trim(),
+      textbookName: String(input?.textbookName ?? '').trim()
     }
   };
 }
@@ -103,8 +113,10 @@ export function recordFeynmanReview(state, userId, noteId, input, now = new Date
 export function listFeynmanNotesForUser(state, userId, filters = {}) {
   const subject = String(filters.subject ?? 'all').trim();
   const mastery = String(filters.mastery ?? 'all').trim();
+  const childId = String(filters.childId ?? 'all').trim();
   return ensureArray(state.feynmanNotes)
     .filter((note) => note.userId === userId)
+    .filter((note) => childId === 'all' || note.childId === childId)
     .filter((note) => subject === 'all' || note.subject === subject)
     .filter((note) => mastery === 'all' || note.mastery === mastery)
     .slice()

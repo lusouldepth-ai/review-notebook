@@ -14,11 +14,18 @@ import {
   runWhisperTranscription,
   writeTempAudioFile
 } from './server/transcribe-runner.mjs';
+import { evaluateWithDeepSeek } from './server/feynman-evaluator.mjs';
 import { getApiErrorStatus, resolveStaticPath } from './server/http-utils.mjs';
+import {
+  createTextbookStore,
+  MIN_TEXTBOOK_RELEVANCE_SCORE,
+  rankRelevantPassages
+} from './server/textbook-store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.join(__dirname, 'web');
 const port = Number(process.env.PORT || 5173);
+const textbookStore = createTextbookStore({ rootDir: path.join(__dirname, 'data', 'textbooks') });
 
 const contentTypeMap = new Map([
   ['.html', 'text/html; charset=utf-8'],
@@ -86,6 +93,23 @@ function readRequestBody(req, maxBytes = 20 * 1024 * 1024) {
       reject(error);
     });
   });
+}
+
+function sendJson(res, statusCode, payload) {
+  res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(payload));
+}
+
+async function readJsonBody(req, maxBytes = 1024 * 1024) {
+  const buffer = await readRequestBody(req, maxBytes);
+  if (buffer.length === 0) return {};
+  try {
+    return JSON.parse(buffer.toString('utf8'));
+  } catch {
+    const error = new Error('invalid_json');
+    error.code = 'INVALID_JSON';
+    throw error;
+  }
 }
 
 async function handleTranscribe(req, res) {
@@ -160,6 +184,148 @@ async function handleOcr(req, res) {
   }
 }
 
+async function handleListTextbooks(requestUrl, res) {
+  const userId = String(requestUrl.searchParams.get('userId') || '').trim();
+  const childId = String(requestUrl.searchParams.get('childId') || '').trim();
+  const grade = String(requestUrl.searchParams.get('grade') || '').trim();
+  if (!userId || !childId) {
+    sendJson(res, 400, { ok: false, error: '缺少家长或孩子档案信息。' });
+    return;
+  }
+  try {
+    const textbooks = await textbookStore.list({ userId, childId, grade });
+    sendJson(res, 200, { ok: true, textbooks });
+  } catch {
+    sendJson(res, 500, { ok: false, error: '教材列表加载失败。' });
+  }
+}
+
+async function handleUploadTextbook(req, requestUrl, res) {
+  try {
+    const buffer = await readRequestBody(req, 25 * 1024 * 1024);
+    const userId = String(requestUrl.searchParams.get('userId') || '').trim();
+    const childId = String(requestUrl.searchParams.get('childId') || '').trim();
+    const subject = String(requestUrl.searchParams.get('subject') || '').trim();
+    const grade = String(requestUrl.searchParams.get('grade') || '').trim();
+    const encodedName = String(req.headers['x-file-name'] || 'textbook.pdf');
+    let filename = 'textbook.pdf';
+    try {
+      filename = decodeURIComponent(encodedName);
+    } catch {
+      filename = 'textbook.pdf';
+    }
+    const result = await textbookStore.create({
+      userId,
+      childId,
+      subject,
+      grade,
+      filename,
+      buffer
+    });
+    sendJson(res, result.ok ? 201 : 400, result);
+  } catch (error) {
+    const status = error?.message === 'payload_too_large' ? 413 : 500;
+    sendJson(res, status, {
+      ok: false,
+      error: status === 413 ? '教材文件不能超过 25MB。' : '教材上传失败。'
+    });
+  }
+}
+
+async function handleFeynmanEvaluation(req, res) {
+  try {
+    const input = await readJsonBody(req);
+    const userId = String(input.userId || '').trim();
+    const childId = String(input.childId || '').trim();
+    const textbookId = String(input.textbookId || '').trim();
+    const topic = String(input.topic || '').trim();
+    const explanation = String(input.explanation || '').trim();
+    const grade = String(input.grade || '').trim();
+    const subject = String(input.subject || '').trim();
+    if (!userId || !childId || !grade || !subject || !topic || !explanation) {
+      sendJson(res, 400, { ok: false, error: '请填写学科、知识点和孩子的讲解。' });
+      return;
+    }
+
+    const candidates = await textbookStore.listWithText({
+      userId,
+      childId,
+      grade,
+      subject,
+      textbookId
+    });
+    if (textbookId && candidates.length === 0) {
+      sendJson(res, 404, { ok: false, error: '没有找到当前孩子的这本教材。' });
+      return;
+    }
+
+    const rankedPassages = candidates
+      .flatMap((textbook) =>
+        rankRelevantPassages(textbook.text, `${topic}\n${topic}\n${explanation}`, 8).map(
+          (passage) => ({
+            ...passage,
+            textbookId: textbook.id,
+            filename: textbook.filename,
+            subject: textbook.subject,
+            grade: textbook.grade
+          })
+        )
+      )
+      .sort((a, b) => b.score - a.score);
+    const passages = rankedPassages
+      .filter((passage) => passage.score >= MIN_TEXTBOOK_RELEVANCE_SCORE)
+      .slice(0, 6);
+    const sourceMode = passages.length > 0 ? 'textbook' : 'general';
+    const matchedIds = new Set(passages.map((passage) => passage.textbookId));
+    const matchedTextbooks = candidates
+      .filter((textbook) => matchedIds.has(textbook.id))
+      .map(({ text, ...textbook }) => textbook);
+
+    const result = await evaluateWithDeepSeek({
+      apiKey: process.env.DEEPSEEK_API_KEY,
+      baseUrl: process.env.DEEPSEEK_BASE_URL,
+      model: process.env.DEEPSEEK_MODEL,
+      input: {
+        grade,
+        subject,
+        topic,
+        explanation,
+        passages,
+        sourceMode
+      }
+    });
+    const basisLabel =
+      sourceMode === 'textbook'
+        ? `已核对：${matchedTextbooks.map((item) => item.filename).join('、')}`
+        : '教材库未可靠命中，使用通用知识评估';
+    sendJson(res, 200, {
+      ok: true,
+      evaluation: result.evaluation,
+      model: result.model,
+      usage: result.usage,
+      basis: {
+        mode: sourceMode,
+        label: basisLabel,
+        matchedPassageCount: passages.length,
+        textbooks: matchedTextbooks
+      },
+      textbook: matchedTextbooks[0] || null
+    });
+  } catch (error) {
+    const status =
+      error?.code === 'INVALID_JSON'
+        ? 400
+        : error?.code === 'AI_NOT_CONFIGURED'
+          ? 503
+          : error?.code === 'AI_UPSTREAM_ERROR'
+            ? 502
+            : error?.code === 'AI_TIMEOUT'
+              ? 504
+              : 500;
+    sendJson(res, status, { ok: false, error: error?.message || 'AI 评估失败。' });
+  }
+}
+
 createServer(async (req, res) => {
   if (!req.url) {
     res.writeHead(400);
@@ -167,13 +333,30 @@ createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === 'POST' && req.url === '/api/transcribe') {
+  const requestUrl = new URL(req.url, 'http://localhost');
+
+  if (req.method === 'POST' && requestUrl.pathname === '/api/transcribe') {
     await handleTranscribe(req, res);
     return;
   }
 
-  if (req.method === 'POST' && req.url === '/api/ocr') {
+  if (req.method === 'POST' && requestUrl.pathname === '/api/ocr') {
     await handleOcr(req, res);
+    return;
+  }
+
+  if (requestUrl.pathname === '/api/textbooks' && req.method === 'GET') {
+    await handleListTextbooks(requestUrl, res);
+    return;
+  }
+
+  if (requestUrl.pathname === '/api/textbooks' && req.method === 'POST') {
+    await handleUploadTextbook(req, requestUrl, res);
+    return;
+  }
+
+  if (requestUrl.pathname === '/api/feynman/evaluate' && req.method === 'POST') {
+    await handleFeynmanEvaluation(req, res);
     return;
   }
 
