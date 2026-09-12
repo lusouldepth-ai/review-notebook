@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  buildAccountRestoreMessage,
   detectLoginMethod,
   listSavedLoginAccounts,
   loginWithLocalState,
@@ -104,6 +105,21 @@ test('listSavedLoginAccounts returns valid accounts with child and mistake count
   assert.equal(accounts[0].mistakeCount, 2);
   assert.equal(accounts[1].childCount, 1);
   assert.equal(accounts[1].mistakeCount, 1);
+});
+
+test('buildAccountRestoreMessage distinguishes empty and restored accounts', () => {
+  assert.match(
+    buildAccountRestoreMessage({ prefix: '登录成功。', created: false, childCount: 0 }),
+    /当前登录账号没有孩子档案/
+  );
+  assert.match(
+    buildAccountRestoreMessage({ prefix: '登录成功。', created: false, childCount: 2 }),
+    /恢复 2 个孩子及学习记录/
+  );
+  assert.match(
+    buildAccountRestoreMessage({ prefix: '登录成功。', created: true, childCount: 0 }),
+    /已建立对应的本地数据库/
+  );
 });
 
 test('logoutWithLocalState clears current session only', () => {

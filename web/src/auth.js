@@ -116,6 +116,19 @@ export function listSavedLoginAccounts(state) {
     .sort((a, b) => String(b.lastActiveAt).localeCompare(String(a.lastActiveAt)));
 }
 
+export function buildAccountRestoreMessage({ prefix = '', created = false, childCount = 0 } = {}) {
+  const lead = String(prefix).trim();
+  if (created) {
+    return `${lead}${lead ? ' ' : ''}已建立对应的本地数据库。`;
+  }
+
+  if (Number(childCount) === 0) {
+    return `${lead}${lead ? ' ' : ''}当前登录账号没有孩子档案；如果上次已经建档，请切换到当时使用的手机号或邮箱。`;
+  }
+
+  return `${lead}${lead ? ' ' : ''}已从本地数据库恢复 ${childCount} 个孩子及学习记录。`;
+}
+
 export function logoutWithLocalState(state) {
   return {
     ...state,

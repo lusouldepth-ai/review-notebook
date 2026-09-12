@@ -1,4 +1,9 @@
-import { listSavedLoginAccounts, loginWithLocalState, logoutWithLocalState } from './auth.js';
+import {
+  buildAccountRestoreMessage,
+  listSavedLoginAccounts,
+  loginWithLocalState,
+  logoutWithLocalState
+} from './auth.js';
 import { extractAccountState, mergeAccountState } from './account-state.js';
 import { loginLocalAccount, saveLocalAccountState } from './account-state-client.js';
 import {
@@ -291,9 +296,11 @@ async function finishAccountLogin(result, successMessage) {
     if (JSON.stringify(localLearningReviews) !== JSON.stringify(remoteLearningReviews)) {
       await queueAccountSave(state);
     }
-    successMessage = databaseResult.created
-      ? `${successMessage} 已建立对应的本地数据库。`
-      : `${successMessage} 已恢复该账号的孩子和学习记录。`;
+    successMessage = buildAccountRestoreMessage({
+      prefix: successMessage,
+      created: databaseResult.created,
+      childCount: getChildrenForCurrentUser().length
+    });
   } catch (error) {
     databaseState.status = 'error';
     databaseState.error = error?.message || '本地数据库连接失败。';
@@ -347,6 +354,14 @@ async function handleSavedAccountLogin(event) {
 }
 
 async function handleLogout() {
+  await logoutCurrentAccount('已退出登录。');
+}
+
+async function handleAccountRecovery() {
+  await logoutCurrentAccount('请输入上次建立孩子档案时使用的手机号或邮箱。');
+}
+
+async function logoutCurrentAccount(message) {
   await accountSaveQueue.catch(() => undefined);
   recorderController = null;
   feynmanRecorderController = null;
@@ -360,7 +375,7 @@ async function handleLogout() {
   state = saveAppState(logoutWithLocalState(state));
   databaseState.status = 'idle';
   databaseState.error = '';
-  render('已退出登录。');
+  render(message);
 }
 
 function getDatabaseStatusLabel() {
@@ -398,7 +413,13 @@ async function synchronizeCurrentAccountOnStartup() {
     databaseState.status = 'synced';
     maybeTriggerReminder();
     maybeTriggerAutoExport();
-    render(result.created ? '现有记录已迁移到本地数据库。' : '已从本地数据库恢复记录。');
+    render(
+      buildAccountRestoreMessage({
+        prefix: result.created ? '现有记录已迁移。' : '',
+        created: result.created,
+        childCount: getChildrenForCurrentUser().length
+      })
+    );
   } catch (error) {
     databaseState.status = 'error';
     databaseState.error = error?.message || '本地数据库连接失败。';
@@ -2383,10 +2404,10 @@ function renderLoginForm(errorMessage) {
   const savedAccounts = listSavedLoginAccounts(state);
   const savedAccountPanel =
     savedAccounts.length === 0
-      ? `<p class="hint top-gap">这个浏览器里暂时没有可识别的本机账号。请换回之前录错题时用的浏览器或浏览器配置文件。</p>`
+      ? `<p class="hint top-gap">这个浏览器没有登录记录。仍可手动输入上次建档时使用的手机号或邮箱，从本机数据库恢复。</p>`
       : `<section class="top-gap">
-          <h4>本机已保存账号</h4>
-          <p class="hint">如果忘记之前输入的是手机号还是邮箱，可以直接用下面的账号进入。</p>
+          <h4>本浏览器最近使用的账号</h4>
+          <p class="hint">请选择建档时使用的账号，或在上方手动输入当时的手机号或邮箱。</p>
           <div class="form-grid compact-grid">
             ${savedAccounts
               .map(
@@ -2412,7 +2433,7 @@ function renderLoginForm(errorMessage) {
       </div>
       <section class="auth-panel">
         <h3>登录本地错题本</h3>
-        <p class="hint">手机号或邮箱均可，仅用于匹配这台电脑上的对应数据库。</p>
+        <p class="hint">手机号或邮箱仅用于匹配本机数据库；恢复已有档案时，必须与上次建档时填写的一致。</p>
         ${errorMessage ? `<p class="error">${errorMessage}</p>` : ''}
         <form id="login-form" class="form-grid top-gap">
           <label>
@@ -3038,7 +3059,7 @@ function renderUserHome(message) {
           <span class="field-label">当前孩子</span>
           ${
             children.length === 0
-              ? '<button type="button" id="create-first-child-button">建立第一个孩子档案</button>'
+              ? '<button type="button" id="create-first-child-button">查找或建立孩子档案</button>'
               : `<select id="child-switcher">${renderChildrenOptions(children, currentChildId)}</select>
                  <button type="button" id="manage-child-button" class="ghost compact-button">新增或管理孩子</button>`
           }
@@ -3080,8 +3101,16 @@ function renderUserHome(message) {
       children.length === 0
         ? `<section class="workspace-panel child-onboarding top-gap">
             <section class="panel onboarding-panel">
-              <p class="eyebrow">第一步</p>
-              <h2>建立孩子档案</h2>
+              <p class="eyebrow">已有档案</p>
+              <h2>上次已经建立过孩子档案？</h2>
+              <p class="hint">孩子档案按登录账号分别保存。当前账号没有孩子档案，请切换到上次建档时使用的手机号或邮箱，数据库会自动恢复记录。</p>
+              <div class="action-row top-gap">
+                <button type="button" id="switch-account-for-recovery-button">切换账号恢复档案</button>
+              </div>
+              <div class="learning-route top-gap">
+                <strong>建立新档案</strong>
+                <span class="hint">确认这是新账号后，再填写下面的信息。</span>
+              </div>
               <p class="hint">选择孩子当前年级和学习科目。建立后，就能上传对应教材、录入错题并让孩子讲给 AI 听。</p>
               ${renderChildProfileForm()}
             </section>
@@ -3614,8 +3643,12 @@ function renderUserHome(message) {
   childSwitcher?.addEventListener('change', handleSwitchChild);
   const createFirstChildButton = document.getElementById('create-first-child-button');
   createFirstChildButton?.addEventListener('click', () => {
-    document.querySelector('#child-form input[name="name"]')?.focus();
+    document.getElementById('switch-account-for-recovery-button')?.focus();
   });
+  const switchAccountForRecoveryButton = document.getElementById(
+    'switch-account-for-recovery-button'
+  );
+  switchAccountForRecoveryButton?.addEventListener('click', handleAccountRecovery);
   const manageChildButton = document.getElementById('manage-child-button');
   manageChildButton?.addEventListener('click', handleOpenChildManagement);
   const childForm = document.getElementById('child-form');
